@@ -1,67 +1,58 @@
 cmake_minimum_required(VERSION 3.10)
-
-# 设置项目名称
 project(Embedding_APP)
 
-# 设置 C++ 标准
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# 添加选项，默认不使用 CUDA
+option(USE_CUDA "Use CUDA for acceleration" OFF)
 
-# 定义编译选项
-option(USE_CUDA "Compile with CUDA support" OFF)
+# find_package(SentencePiece REQUIRED)
+find_path(SentencePiece_INCLUDE_DIRS NAMES sentencepiece_processor.h
+          PATHS /usr/include /usr/local/include /usr/local/Cellar/sentencepiece/*/include)
+find_library(SentencePiece_LIBRARIES NAMES sentencepiece
+             PATHS /usr/lib /usr/local/lib /usr/local/Cellar/sentencepiece/*/lib)
 
-# 查找 tokenizers 库和 nlohmann/json 库
-find_package(tokenizers-cpp REQUIRED)
-find_package(nlohmann_json REQUIRED)
 
-# 设置头文件包含路径
-include_directories(
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/thirdparty/FlashInfer/include
-)
-
-# 设置库文件链接路径
-link_directories(
-    ${CMAKE_SOURCE_DIR}/thirdparty/FlashInfer/lib
-)
-
-# 根据选项收集源文件
 if(USE_CUDA)
+    # Enable CUDA support
+    enable_language(CUDA)
+
+    # Find CUDA
     find_package(CUDA REQUIRED)
-    file(GLOB_RECURSE SOURCES 
-        "src/*.cpp" 
-        "src/ops/cuda/*.cpp" 
-        "src/ops/cuda/*.cu"
-    )
-    cuda_add_executable(Embedding_APP
-        app.cpp
-        ${SOURCES}
-    )
-    target_link_libraries(Embedding_APP
-        flashinfer  # 实际使用时替换为正确的库名
-        tokenizers-cpp::tokenizers-cpp
-        nlohmann_json::nlohmann_json
-        ${CUDA_LIBRARIES}
-    )
+
+    # Set CUDA architecture
+    set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-O3 -arch=sm_75)
+
+    # Source files
+    file(GLOB_RECURSE CUDA_SOURCES "src/ops/cuda/*.cu")
+    file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cuda/*.cpp")
+
+    # Include directories
+    include_directories(${CUDA_INCLUDE_DIRS} include include/ops)
+
+    # Link libraries
+    set(ADDITIONAL_LIBS ${CUDA_LIBRARIES})
 else()
-    file(GLOB_RECURSE SOURCES 
-        "src/*.cpp" 
-        "src/ops/cpu/*.cpp"
-    )
-    add_executable(Embedding_APP
-        app.cpp
-        ${SOURCES}
-    )
-    target_link_libraries(Embedding_APP
-        flashinfer  # 实际使用时替换为正确的库名
-        tokenizers-cpp::tokenizers-cpp
-        nlohmann_json::nlohmann_json
-    )
+    # 仅查找非 CUDA 相关的 C++ 源文件
+    file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cpu/*.cpp")
+    # list(FILTER CPP_SOURCES EXCLUDE REGEX "src/ops/cpu/.*\\.cpp")
+
+    # Include directories
+    include_directories(include include/ops)
+
+    # 不添加额外库
+    set(ADDITIONAL_LIBS "")
 endif()
 
-# 可选：设置编译选项
-if(MSVC)
-    target_compile_options(Embedding_APP PRIVATE /W4 /WX)
-else()
-    target_compile_options(Embedding_APP PRIVATE -Wall -Wextra -Werror)
-endif()
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+
+include_directories(${SentencePiece_INCLUDE_DIRS})
+
+
+# Executable
+add_executable(Embedding_APP app.cpp ${CPP_SOURCES})
+
+
+target_link_libraries(Embedding_APP 
+    ${ADDITIONAL_LIBS}
+    ${SentencePiece_LIBRARIES}
+)

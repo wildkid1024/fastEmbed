@@ -1,3 +1,5 @@
+#include "cuda_flash_attention.h"
+
 #include <cuda_runtime.h>
 #include <cmath>
 

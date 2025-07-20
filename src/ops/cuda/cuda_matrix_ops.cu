@@ -1,4 +1,6 @@
 #include "cuda_matrix_ops.h"
+#include <vector>
+#include <cmath>
 #include <cuda_runtime.h>
 #include "cuda_matrix_ops_kernel.cu"
 
@@ -33,12 +35,17 @@ std::vector<float> CUDAMatrixOps::matrix_multiply(const std::vector<float>& mat1
     return result;
 }
 
+
 void CUDAMatrixOps::softmax(std::vector<float>& input) {
     float *d_input;
     cudaMalloc((void**)&d_input, input.size() * sizeof(float));
     cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    softmax_kernel<<<1, 256>>>(d_input, input.size());
+    // compute_softmax(d_input, input.size());
+    dim3 block(256);
+    dim3 grid((num_cols + block.x - 1) / block.x, num_rows);
+    softmax_kernel<<<grid, block>>>(input, num_rows, num_cols);
+    cudaDeviceSynchronize();
 
     cudaMemcpy(input.data(), d_input, input.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(d_input);

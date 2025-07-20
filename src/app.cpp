@@ -1,3 +1,4 @@
+/*
 #include "sentence_transformers.h"
 #include "safetensors.h"
 #include "flashinfer/flashinfer.h"  // FlashInfer库
@@ -579,4 +580,4 @@ size_t SentenceTransformer::get_embedding_dimension() const {
 // 移动构造和赋值
 SentenceTransformer::SentenceTransformer(SentenceTransformer&&) noexcept = default;
 SentenceTransformer& SentenceTransformer::operator=(SentenceTransformer&&) noexcept = default;
-    
+*/

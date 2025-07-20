@@ -1,10 +1,12 @@
-#include "cuda_attention_ops.h"
+#include "cuda_flash_attention.h"
 #include "cuda_matrix_ops.h"
 #include <vector>
 #include <cuda_runtime.h>
 
-CUDAAttentionOps::CUDAAttentionOps() = default;
+// Include the header file with CUDAAttentionOps declaration
+#include "ops/cuda_attention_ops.h"
 
+// Implement the multi_head_attention function
 std::vector<float> CUDAAttentionOps::multi_head_attention(
     const std::vector<float>& input,
     const std::vector<float>& weight_q,

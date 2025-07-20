@@ -2,7 +2,9 @@ version: "3.9"
 
 services:
   cuda-dev:
-    image: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+    # 使用 build 指令通过 Dockerfile 构建镜像
+    image: cuda-cpp-build:v1.0.0
+    build: .
     container_name: cuda_cpp_build
     # 使用宿主机网络
     network_mode: host
@@ -12,3 +14,12 @@ services:
     tty: true
     stdin_open: true
     command: bash
+    # 设置 runtime 为 nvidia
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

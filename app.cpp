@@ -5,12 +5,17 @@
 
 int main() {
     try {
-        momdel_path = ""
-        SentenceTransformer model("path/to/your/model");
+        std::string model_path = "/home/wildkid1024/Public/Models/bge-small-zh-v1.5";
+
+        // 假设 SentenceTransformer 构造函数支持传入分词器路径
+        SentenceTransformer model(model_path);
+
         std::vector<std::string> texts = {"This is a test sentence.", "Another example sentence."};
         std::vector<std::vector<float>> embeddings = model.encode_batch(texts);
 
         for (const auto& embedding : embeddings) {
+            // 打印每个文本的嵌入向量shape
+            std::cout << "embedding shape: " << embedding.size() << std::endl;
             for (float val : embedding) {
                 std::cout << val << " ";
             }
