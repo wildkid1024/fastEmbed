@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  cuda-dev:
+    image: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+    container_name: cuda_cpp_build
+    # 使用宿主机网络
+    network_mode: host
+    volumes:
+      - ./:/workspace/Embedding_app
+    working_dir: /workspace/Embedding_app
+    tty: true
+    stdin_open: true
+    command: bash
