@@ -10,14 +10,12 @@
 void SentenceTransformerImpl::load_vocab(const std::string& config_path) {
     std::ifstream config_file(config_path);
     if (!config_file.is_open()) {
-        throw std::runtime_error("无法打开 config.json 文件: " + config_path);
+        throw std::runtime_error("无法打开 tokenizer.json 文件: " + config_path);
     }
 
-    json config;
+    nlohmann::json config;
     config_file >> config;
 
-    // 取['model']['vocab']中的数据表
-    // json vocab_json = config["model"]["vocab"];
     config = config["model"];
     
     if (config.contains("vocab") && config["vocab"].is_object()) {
@@ -27,7 +25,7 @@ void SentenceTransformerImpl::load_vocab(const std::string& config_path) {
             }
         }
     } else {
-        throw std::runtime_error("config.json 中未找到有效的词汇表字段");
+        throw std::runtime_error("tokenizer.json 中未找到有效的词汇表字段");
     }
 }
 
@@ -57,12 +55,26 @@ std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<in
     return output;
 }
 
-SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path, const std::string& config_path)
-    : tokenizer(model_path + "/vocab.txt") { // 假设词汇表文件在 model_path 下
+SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path)
+    : tokenizer(tokenizer_path + "/vocab.txt") { // 假设词汇表文件在 model_path 下
     // 加载词汇表
-    load_vocab(config_path);
+
+    std::string tokenizer_model_path = tokenizer_path + "/tokenizer.model";  // Replace with the actual way to get tokenizer_path
+    std::string tokenizer_config_path = tokenizer_path + "/tokenizer.json";       // Replace with the actual way to get config_path
+    load_vocab(tokenizer_config_path);
 
     std::string tensor_path = model_path + "/model.safetensors";
+    std::string config_path = model_path + "/config.json";
+
+    //  加载config_path到私有的config
+    std::ifstream config_file(config_path);
+    if (!config_file.is_open()) {
+        throw std::runtime_error("无法打开 config.json 文件: " + config_path);
+    }
+
+    // 移除局部变量，使用类成员变量
+    nlohmann::json config;
+    config_file >> this->config;  // 或直接使用 config
 
     if (!load_single_safetensors_file(tensor_path, weights)) {  // 使用函数
         throw std::runtime_error("加载模型权重失败");
@@ -132,16 +144,17 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         }
     }
     // {{ 段嵌入添加结束 }}
-
+    const float epsilon = this->config["layer_norm_eps"];
+    
     // 应用嵌入层 LayerNorm（词嵌入 + 位置嵌入 + 段嵌入 后的归一化）
     const std::vector<float>& ln_weight = weights["embeddings.LayerNorm.weight"];
     const std::vector<float>& ln_bias = weights["embeddings.LayerNorm.bias"];
-    embedded = cpu_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim);
+    embedded = cpu_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim, epsilon);
 
     // {{ 预训练位置嵌入处理结束 }}
     
     // 假设 BGE 模型有 4 层 Transformer 编码器
-    const int num_layers = 4;
+    const int num_layers = this->config["num_hidden_layers"];
     for (int layer = 0; layer < num_layers; ++layer) {
         std::string q_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.self.query.weight";
         std::string k_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.self.key.weight";
@@ -182,12 +195,11 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         const std::vector<float>& ln_ff_gamma = weights[ln_ff_gamma_name];
         const std::vector<float>& ln_ff_beta = weights[ln_ff_beta_name];
 
+        int num_attention_heads = this->config["num_attention_heads"];
         // 多头注意力机制
         // 修改多头注意力调用，传递偏置参数
-        std::vector<float> attn_output = multi_head_attention(embedded, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, 8, embedding_dim);
+        std::vector<float> attn_output = multi_head_attention(embedded, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_attention_heads, embedding_dim);
         // {{ 新增：注意力输出 Dense 层（修复未使用 weight 的问题）}}
-        // 1. 构造当前层的 attention.output.dense 权重名称
-        
         // 3. 矩阵乘法：attn_output（[seq_len, embedding_dim]） × 权重（[embedding_dim, embedding_dim]）
         size_t batch_seq_len = attn_output.size() / embedding_dim;
         attn_output = cpu_matrix_ops.matrix_multiply_transpose(attn_output, attn_dense_weight, batch_seq_len, embedding_dim, embedding_dim);
@@ -204,9 +216,9 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         }
 
         // 层归一化
-        attn_output = cpu_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim);
+        attn_output = cpu_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim, epsilon);
 
-        const int intermediate_dim = 2048;
+        const int intermediate_dim = this->config["intermediate_size"];
 
         // 前馈神经网络（修改调用参数）
         std::vector<float> ff_output = feed_forward_network(
@@ -338,6 +350,7 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
                                                                   size_t intermediate_dim,
                                                                   float dropout_prob) {  // 新增dropout参数
     size_t batch_seq_len = input.size() / embedding_dim;
+    const float epsilon = this->config["layer_norm_eps"];
 
     // 第一层线性变换
     std::vector<float> hidden = cpu_matrix_ops.matrix_multiply_transpose(
@@ -350,7 +363,15 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
     }
 
     // 激活函数
-    hidden = cpu_matrix_ops.gelu(hidden);
+    if (this->config["hidden_act"] == "gelu") {
+        hidden = cpu_matrix_ops.gelu(hidden);
+    } else if (this->config["hidden_act"] == "relu") {
+        hidden = cpu_matrix_ops.relu(hidden);
+    } else if (this->config["hidden_act"] == "swish") {
+        hidden = cpu_matrix_ops.swish(hidden);
+    } else {
+        throw std::runtime_error("Unsupported activation function");
+    }
 
     // 第二层线性变换
     std::vector<float> output = cpu_matrix_ops.matrix_multiply_transpose(
@@ -369,7 +390,7 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
     for (size_t i = 0; i < output.size(); ++i) {
         output[i] += input[i];  // 残差连接
     }
-    output = cpu_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim);  // 层归一化
+    output = cpu_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim, epsilon);  // 层归一化
 
     return output;
 }

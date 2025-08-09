@@ -24,6 +24,7 @@ private:
     CPUAttentionOps cpu_attention_ops; 
     // 定义 CPUMatrixOps 实例
     CPUMatrixOps cpu_matrix_ops; 
+    nlohmann::json config;  // 添加 JSON 配置私有成员
 
     // Private helper functions
     void load_vocab(const std::string& config_path);
@@ -55,7 +56,7 @@ private:
     std::vector<float> bge_forward(const std::vector<int32_t>& tokens);
 
 public:
-    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path, const std::string& config_path);
+    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
     std::vector<float> encode(const std::string& text);
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
     size_t get_embedding_dimension() const;

@@ -6,8 +6,7 @@
 SentenceTransformer::SentenceTransformer(const std::string& model_path)
     : impl(std::make_unique<SentenceTransformerImpl>(
         model_path,
-        model_path + "/tokenizer.model",  // Replace with the actual way to get tokenizer_path
-        model_path + "/tokenizer.json"       // Replace with the actual way to get config_path
+        model_path
     )) {}
 
 SentenceTransformer::~SentenceTransformer() = default;

@@ -66,11 +66,21 @@ def main():
 def test_sentence_transformers():
     from sentence_transformers.models.Pooling import Pooling
     from sentence_transformers.models.Normalize import Normalize
-    model = SentenceTransformer("/home/wildkid1024/Public/Models/bge-small-zh-v1.5")
+    model = SentenceTransformer("/home/wildkid1024/Public/Models/bge-large-zh-v1.5")
     print(model)
     texts = ["This is a test sentence.","Another example sentence."]  # 使用中文确保分词一致
     embedding = model.encode(texts)
     print(embedding)
 
+def trans_torch_to_safetensors():
+    from safetensors.torch import save_file
+    import torch
+
+    model_path = '/home/wildkid1024/Public/Models/bge-large-zh-v1.5'
+    state_dict = torch.load(f"{model_path}/pytorch_model.bin", map_location="cpu")
+    save_file(state_dict, f"{model_path}/model.safetensors")
+    print("Safetensors 文件已保存")
+
 if __name__ == "__main__":
     test_sentence_transformers()
+    # trans_torch_to_safetensors()

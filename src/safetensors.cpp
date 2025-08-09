@@ -28,8 +28,6 @@ bool load_single_safetensors_file(const std::string& file_path, std::unordered_m
 
         // 读取头部长度
         uint64_t header_length = read_header_length(file);
-        // 打印头部长度
-        std::cout << "头部长度: " << header_length << std::endl;
 
         // 读取头部 JSON 数据
         std::string header_json(header_length, '\0');
@@ -37,9 +35,6 @@ bool load_single_safetensors_file(const std::string& file_path, std::unordered_m
 
         // 解析 JSON
         json header = json::parse(header_json);
-
-        // 打印头部 JSON 数据
-        std::cout << "头部 JSON 数据: " << header_json << std::endl;
 
         // 遍历所有张量
         for (const auto& [name, tensor_info] : header.items()) {

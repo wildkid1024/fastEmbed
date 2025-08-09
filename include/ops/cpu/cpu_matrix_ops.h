@@ -11,6 +11,9 @@ public:
                                        size_t m, size_t n, size_t k);
     // GELU 激活函数方法
     std::vector<float> gelu(const std::vector<float>& input);
+    // 添加ReLU和Swish函数声明
+    std::vector<float> relu(const std::vector<float>& input);
+    std::vector<float> swish(const std::vector<float>& input);
     // 层归一化方法
     std::vector<float> layer_norm(const std::vector<float>& input, 
                                   const std::vector<float>& gamma, 

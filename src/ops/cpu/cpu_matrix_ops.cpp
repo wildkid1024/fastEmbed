@@ -42,6 +42,24 @@ std::vector<float> CPUMatrixOps::gelu(const std::vector<float>& input) {
     return output;
 }
 
+// ReLU 激活函数实现
+std::vector<float> CPUMatrixOps::relu(const std::vector<float>& input) {
+    std::vector<float> output = input;
+    for (size_t i = 0; i < output.size(); ++i) {
+        output[i] = std::max(0.0f, output[i]);
+    }
+    return output;
+}
+
+// Swish 激活函数实现
+std::vector<float> CPUMatrixOps::swish(const std::vector<float>& input) {
+    std::vector<float> output = input;
+    for (size_t i = 0; i < output.size(); ++i) {
+        output[i] = output[i] / (1.0f + std::exp(-output[i]));
+    }
+    return output;
+}
+
 // 层归一化实现
 std::vector<float> CPUMatrixOps::layer_norm(const std::vector<float>& input, 
                                             const std::vector<float>& gamma, 
