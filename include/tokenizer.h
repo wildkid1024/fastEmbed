@@ -9,6 +9,8 @@ class BGETokenizer {
 private:
     std::unordered_map<std::string, int> vocab;
     std::unordered_map<int, std::string> id_to_token;
+    // WordPiece subword splitting helper function
+    std::vector<std::string> wordpiece_split(const std::string& token);
 
 public:
     BGETokenizer(const std::string& vocab_file);

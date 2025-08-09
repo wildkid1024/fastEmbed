@@ -35,6 +35,8 @@ void SentenceTransformerImpl::load_vocab(const std::string& config_path) {
 std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) {
     auto tokens = tokenizer.tokenize(text);
     auto token_ids = tokenizer.encode(tokens);
+    token_ids.insert(token_ids.begin(), 101);
+    token_ids.push_back(102);
     return std::vector<int32_t>(token_ids.begin(), token_ids.end());
 }
 
@@ -85,23 +87,78 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
 
 // 完整的 BGE 前向传播
 std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_t>& tokens) {
-    // 先通过嵌入层
+    // 先通过嵌入层（词嵌入）
     std::vector<float> embedded = embedding_layer(tokens);
     size_t seq_len = tokens.size();
 
-    // 添加位置编码
-    embedded = add_position_encoding(embedded, seq_len, embedding_dim);
+    // {{ 修改前：使用生成式位置编码 }}
+    // embedded = add_position_encoding(embedded, seq_len, embedding_dim);
+    // {{ 修改后：使用预训练位置嵌入 }}
+    // 获取位置嵌入 (shape: [max_seq_len, embedding_dim])
+    const std::vector<float>& pos_embeddings = weights["embeddings.position_embeddings.weight"];
+    size_t max_seq_len = pos_embeddings.size() / embedding_dim;
+    if (seq_len > max_seq_len) {
+        throw std::runtime_error("序列长度超过位置嵌入的最大长度");
+    }
+    
+    // 词嵌入 + 位置嵌入
+    for (size_t i = 0; i < seq_len; ++i) {
+        size_t pos_start = i * embedding_dim;
+        for (size_t j = 0; j < embedding_dim; ++j) {
+            embedded[pos_start + j] += pos_embeddings[pos_start + j];
+        }
+    }
+    
+    // {{ 新增：添加 token type 嵌入（段嵌入）}}
+    // 1. 检查段嵌入权重是否存在
+    if (weights.find("embeddings.token_type_embeddings.weight") == weights.end()) {
+        throw std::runtime_error("未找到段嵌入权重: embeddings.token_type_embeddings.weight");
+    }
+    const std::vector<float>& token_type_embeddings = weights["embeddings.token_type_embeddings.weight"];
 
+    // 2. 单句场景：所有 token 的段 ID 为 0（句子对需区分 0/1，此处简化）
+    size_t segment_id = 0;  // 段 ID（0 表示第一句，1 表示第二句）
+    size_t token_type_dim = token_type_embeddings.size() / embedding_dim;  // 段类型数量（通常为 2）
+    if (segment_id >= token_type_dim) {
+        throw std::runtime_error("段 ID 超出范围（最大段类型数量: " + std::to_string(token_type_dim) + "）");
+    }
+
+    // 3. 叠加段嵌入（每个 token 叠加对应段 ID 的嵌入向量）
+    size_t token_type_start = segment_id * embedding_dim;  // 段 ID 对应嵌入的起始索引
+    for (size_t i = 0; i < seq_len; ++i) {
+        size_t token_start = i * embedding_dim;  // 当前 token 的嵌入起始索引
+        for (size_t j = 0; j < embedding_dim; ++j) {
+            embedded[token_start + j] += token_type_embeddings[token_type_start + j];
+        }
+    }
+    // {{ 段嵌入添加结束 }}
+
+    // 应用嵌入层 LayerNorm（词嵌入 + 位置嵌入 + 段嵌入 后的归一化）
+    const std::vector<float>& ln_weight = weights["embeddings.LayerNorm.weight"];
+    const std::vector<float>& ln_bias = weights["embeddings.LayerNorm.bias"];
+    embedded = cpu_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim);
+
+    // {{ 预训练位置嵌入处理结束 }}
+    
     // 假设 BGE 模型有 4 层 Transformer 编码器
     const int num_layers = 4;
     for (int layer = 0; layer < num_layers; ++layer) {
         std::string q_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.self.query.weight";
         std::string k_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.self.key.weight";
         std::string v_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.self.value.weight";
-        std::string ff_weight_1_name = "encoder.layer." + std::to_string(layer) + ".intermediate.dense.weight";
-        std::string ff_weight_2_name = "encoder.layer." + std::to_string(layer) + ".output.dense.weight";
+        // 添加QKV偏置名称
+        std::string q_bias_name = "encoder.layer." + std::to_string(layer) + ".attention.self.query.bias";
+        std::string k_bias_name = "encoder.layer." + std::to_string(layer) + ".attention.self.key.bias";
+        std::string v_bias_name = "encoder.layer." + std::to_string(layer) + ".attention.self.value.bias";
         std::string ln_gamma_name = "encoder.layer." + std::to_string(layer) + ".attention.output.LayerNorm.weight";
         std::string ln_beta_name = "encoder.layer." + std::to_string(layer) + ".attention.output.LayerNorm.bias";
+        std::string attn_dense_weight_name = "encoder.layer." + std::to_string(layer) + ".attention.output.dense.weight";
+        std::string attn_dense_bias_name = "encoder.layer." + std::to_string(layer) + ".attention.output.dense.bias";
+
+        std::string ff_weight_1_name = "encoder.layer." + std::to_string(layer) + ".intermediate.dense.weight";
+        std::string ff_bias_1_name = "encoder.layer." + std::to_string(layer) + ".intermediate.dense.bias";
+        std::string ff_weight_2_name = "encoder.layer." + std::to_string(layer) + ".output.dense.weight";
+        std::string ff_bias_2_name = "encoder.layer." + std::to_string(layer) + ".output.dense.bias";
         std::string ln_ff_gamma_name = "encoder.layer." + std::to_string(layer) + ".output.LayerNorm.weight";
         std::string ln_ff_beta_name = "encoder.layer." + std::to_string(layer) + ".output.LayerNorm.bias";
 
@@ -109,41 +166,110 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         const std::vector<float>& weight_q = weights[q_weight_name];
         const std::vector<float>& weight_k = weights[k_weight_name];
         const std::vector<float>& weight_v = weights[v_weight_name];
-        const std::vector<float>& weight_ff_1 = weights[ff_weight_1_name];
-        const std::vector<float>& weight_ff_2 = weights[ff_weight_2_name];
+        // 添加QKV偏置权重
+        const std::vector<float>& query_bias = weights[q_bias_name];
+        const std::vector<float>& key_bias = weights[k_bias_name];
+        const std::vector<float>& value_bias = weights[v_bias_name];
+        const std::vector<float>& attn_dense_weight = weights[attn_dense_weight_name];
+        const std::vector<float>& attn_dense_bias = weights[attn_dense_bias_name];
         const std::vector<float>& ln_gamma = weights[ln_gamma_name];
         const std::vector<float>& ln_beta = weights[ln_beta_name];
+        // {{ 添加前馈网络偏置项 }}
+        const std::vector<float>& weight_ff_1 = weights[ff_weight_1_name];
+        const std::vector<float>& bias_ff_1 = weights[ff_bias_1_name];
+        const std::vector<float>& weight_ff_2 = weights[ff_weight_2_name];
+        const std::vector<float>& bias_ff_2 = weights[ff_bias_2_name];
         const std::vector<float>& ln_ff_gamma = weights[ln_ff_gamma_name];
         const std::vector<float>& ln_ff_beta = weights[ln_ff_beta_name];
 
         // 多头注意力机制
-        std::vector<float> attn_output = multi_head_attention(embedded, weight_q, weight_k, weight_v, 12, embedding_dim);
+        // 修改多头注意力调用，传递偏置参数
+        std::vector<float> attn_output = multi_head_attention(embedded, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, 8, embedding_dim);
+        // {{ 新增：注意力输出 Dense 层（修复未使用 weight 的问题）}}
+        // 1. 构造当前层的 attention.output.dense 权重名称
+        
+        // 3. 矩阵乘法：attn_output（[seq_len, embedding_dim]） × 权重（[embedding_dim, embedding_dim]）
+        size_t batch_seq_len = attn_output.size() / embedding_dim;
+        attn_output = cpu_matrix_ops.matrix_multiply_transpose(attn_output, attn_dense_weight, batch_seq_len, embedding_dim, embedding_dim);
+        
+        // 4. 叠加偏置
+        for (size_t i = 0; i < attn_output.size(); ++i) {
+            attn_output[i] += attn_dense_bias[i % embedding_dim];
+        }
+        // {{ Dense 层处理结束 }}
 
-        // 残差连接
+        // 残差连接（当前层输入 + Dense 层输出）
         for (size_t i = 0; i < embedded.size(); ++i) {
             attn_output[i] += embedded[i];
         }
 
-        // 层归一化，调用 cpu_matrix_ops 中的实现
+        // 层归一化
         attn_output = cpu_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim);
 
-        // 前馈神经网络
-        std::vector<float> ff_output = feed_forward_network(attn_output, weight_ff_1, weight_ff_2, embedding_dim, 3072);
+        const int intermediate_dim = 2048;
 
-        // 残差连接
-        for (size_t i = 0; i < attn_output.size(); ++i) {
-            ff_output[i] += attn_output[i];
-        }
-
-        // 层归一化，调用 cpu_matrix_ops 中的实现
-        ff_output = cpu_matrix_ops.layer_norm(ff_output, ln_ff_gamma, ln_ff_beta, embedding_dim);
-
+        // 前馈神经网络（修改调用参数）
+        std::vector<float> ff_output = feed_forward_network(
+            attn_output, 
+            weight_ff_1, bias_ff_1, 
+            weight_ff_2, bias_ff_2,
+            ln_ff_gamma, ln_ff_beta,  // 传递LayerNorm参数
+            embedding_dim, intermediate_dim,
+            0.1f  // dropout概率
+        );
+            
         embedded = ff_output;
     }
 
-    // 池化层，取 [CLS] 标记的输出作为句子表示
-    std::vector<float> pooled(embedding_dim);
-    std::copy_n(embedded.begin(), embedding_dim, pooled.begin());
+    
+    // {{ 添加池化层处理（使用 pooler.dense.weight 和 pooler.dense.bias ）}}
+    const std::vector<float>& pooler_weight = weights["pooler.dense.weight"];
+    const std::vector<float>& pooler_bias = weights["pooler.dense.bias"];
+
+    // 池化层处理 - 使用cpu_matrix_ops矩阵乘加算法
+    std::vector<float> cls_output(embedding_dim);
+    std::copy_n(embedded.begin(), embedding_dim, cls_output.begin());
+
+    /*
+    // pooler.dense 池化，用于分类任务
+    // 使用matrix_multiply_transpose替换手动矩阵乘法
+    std::vector<float> pooled = cpu_matrix_ops.matrix_multiply_transpose(
+        cls_output,  // 输入向量 [1, embedding_dim]
+        pooler_weight,  // 权重矩阵 [embedding_dim, embedding_dim]
+        1,  // batch_size
+        embedding_dim,  // input_dim
+        embedding_dim   // output_dim
+    );
+    
+    // 添加偏置
+    for (size_t i = 0; i < embedding_dim; ++i) {
+        pooled[i] += pooler_bias[i];
+    }
+    
+    // 应用tanh激活
+    for (float& val : pooled) {
+        val = std::tanh(val);
+    }
+    // {{ 池化层处理结束 }}
+    */
+
+    /*
+    //  平均池化
+    // std::vector<float> pooled;
+    pooled.resize(embedding_dim, 0.0f);
+    for (size_t i = 0; i < embedded.size(); i += embedding_dim) {
+        // if (i == 0) continue;
+        for (size_t j = 0; j < embedding_dim; ++j) {
+            pooled[j] += embedded[i + j];
+        }
+    }
+
+    size_t token_count = (embedded.size() / embedding_dim) - 1; // 减去CLS token
+    for (float& val : pooled) {
+        val /= token_count;
+    }
+    */
+    std::vector<float> pooled = cls_output;
 
     // 归一化
     float norm = 0.0f;
@@ -184,28 +310,66 @@ size_t SentenceTransformerImpl::get_embedding_dimension() const {
 }
 
 // 实现 SentenceTransformerImpl 的 multi_head_attention 函数
-std::vector<float> SentenceTransformerImpl::multi_head_attention(const std::vector<float>& input, const std::vector<float>& weight_q, const std::vector<float>& weight_k, const std::vector<float>& weight_v, size_t num_heads, size_t embedding_dim) {
+std::vector<float> SentenceTransformerImpl::multi_head_attention(
+    const std::vector<float>& input,
+    const std::vector<float>& weight_q,
+    const std::vector<float>& weight_k,
+    const std::vector<float>& weight_v,
+    const std::vector<float>& query_bias,  // New: query bias
+    const std::vector<float>& key_bias,    // New: key bias
+    const std::vector<float>& value_bias,  // New: value bias
+    size_t num_heads,
+    size_t embedding_dim
+) {
     // 调用 CPUAttentionOps 的 multi_head_attention 方法
-    return cpu_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, num_heads, embedding_dim);
+    return cpu_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_heads, embedding_dim);
 }
 
 // 实现 SentenceTransformerImpl 的 feed_forward_network 函数
-std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vector<float>& input, const std::vector<float>& weight_ff_1, const std::vector<float>& weight_ff_2, size_t embedding_dim, size_t intermediate_dim) {
-    // 计算第一层线性变换
-    // input 维度: [batch_size * seq_len, embedding_dim]
-    // weight_ff_1 维度: [embedding_dim, intermediate_dim]
-    // 输出维度: [batch_size * seq_len, intermediate_dim]
+// {{ 修改函数签名，添加偏置参数 }}
+std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vector<float>& input, 
+                                                                  const std::vector<float>& weight_ff_1, 
+                                                                  const std::vector<float>& bias_ff_1, 
+                                                                  const std::vector<float>& weight_ff_2, 
+                                                                  const std::vector<float>& bias_ff_2, 
+                                                                  const std::vector<float>& ln_gamma,  // 新增LayerNorm参数
+                                                                  const std::vector<float>& ln_beta,   // 新增LayerNorm参数
+                                                                  size_t embedding_dim, 
+                                                                  size_t intermediate_dim,
+                                                                  float dropout_prob) {  // 新增dropout参数
     size_t batch_seq_len = input.size() / embedding_dim;
-    std::vector<float> hidden = cpu_matrix_ops.matrix_multiply(input, weight_ff_1, batch_seq_len, embedding_dim, intermediate_dim);
 
-    // 应用 GELU 激活函数
+    // 第一层线性变换
+    std::vector<float> hidden = cpu_matrix_ops.matrix_multiply_transpose(
+        input, weight_ff_1, batch_seq_len, embedding_dim, intermediate_dim
+    );
+    
+    // 添加第一层偏置
+    for (size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] += bias_ff_1[i % intermediate_dim];
+    }
+
+    // 激活函数
     hidden = cpu_matrix_ops.gelu(hidden);
 
-    // 计算第二层线性变换
-    // hidden 维度: [batch_size * seq_len, intermediate_dim]
-    // weight_ff_2 维度: [intermediate_dim, embedding_dim]
-    // 输出维度: [batch_size * seq_len, embedding_dim]
-    std::vector<float> output = cpu_matrix_ops.matrix_multiply(hidden, weight_ff_2, batch_seq_len, intermediate_dim, embedding_dim);
+    // 第二层线性变换
+    std::vector<float> output = cpu_matrix_ops.matrix_multiply_transpose(
+        hidden, weight_ff_2, batch_seq_len, intermediate_dim, embedding_dim
+    );
+    
+    // 添加第二层偏置
+    for (size_t i = 0; i < output.size(); ++i) {
+        output[i] += bias_ff_2[i % embedding_dim];
+    }
+
+    // 添加Dropout层（需要在cpu_matrix_ops中实现）
+    // output = cpu_matrix_ops.dropout(output, dropout_prob);
+
+    // 残差连接 + LayerNorm（与PyTorch实现一致）
+    for (size_t i = 0; i < output.size(); ++i) {
+        output[i] += input[i];  // 残差连接
+    }
+    output = cpu_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim);  // 层归一化
 
     return output;
 }

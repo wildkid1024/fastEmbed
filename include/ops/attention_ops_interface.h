@@ -12,6 +12,9 @@ public:
         const std::vector<float>& weight_q,
         const std::vector<float>& weight_k,
         const std::vector<float>& weight_v,
+        const std::vector<float>& query_bias,  // New: query bias
+        const std::vector<float>& key_bias,    // New: key bias
+        const std::vector<float>& value_bias,  // New: value bias
         size_t num_heads,
         size_t embedding_dim
     ) = 0;

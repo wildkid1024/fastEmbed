@@ -3,6 +3,20 @@
 #include <algorithm>
 #include <stdexcept> // Add this line to include the stdexcept header
 
+
+std::vector<float> CPUMatrixOps::matrix_multiply_transpose(const std::vector<float>& a, const std::vector<float>& b, 
+                                                 size_t m, size_t n, size_t k) {
+    std::vector<float> result(m * k, 0.0f);
+    for (size_t i = 0; i < m; ++i) {
+        for (size_t j = 0; j < k; ++j) {
+            for (size_t p = 0; p < n; ++p) {
+                result[i * k + j] += a[i * n + p] * b[j * n + p];
+            }
+        }
+    }
+    return result;
+}
+
 // 矩阵乘法实现
 std::vector<float> CPUMatrixOps::matrix_multiply(const std::vector<float>& a, const std::vector<float>& b, 
                                                  size_t m, size_t n, size_t k) {
@@ -60,9 +74,9 @@ std::vector<float> CPUMatrixOps::layer_norm(const std::vector<float>& input,
 }
 
 // Softmax 实现
-std::vector<float> CPUMatrixOps::softmax(const std::vector<float>& input, size_t axis) {
+std::vector<float> CPUMatrixOps::softmax(const std::vector<float>& input, size_t axis, size_t dim_size) {
     if (axis == 0) {
-        // 沿第 0 维计算 Softmax
+        // 沿第 0 维计算 Softmax（向量）
         std::vector<float> output = input;
         float max_val = *std::max_element(input.begin(), input.end());
         float sum = 0.0f;
@@ -78,24 +92,23 @@ std::vector<float> CPUMatrixOps::softmax(const std::vector<float>& input, size_t
 
         return output;
     } else if (axis == 1) {
-        // 沿第 1 维计算 Softmax，假设输入为二维矩阵展开形式
-        // 这里简单假设输入的维度是 embedding_dim 的整数倍
-        size_t embedding_dim = 768; // 可根据实际情况修改或通过参数传入
-        size_t num_rows = input.size() / embedding_dim;
+        // 使用传入的dim_size，不再硬编码768
+        size_t actual_dim = (dim_size > 0) ? dim_size : 768; // 兼容旧调用
+        size_t num_rows = input.size() / actual_dim;
         std::vector<float> output = input;
 
         for (size_t i = 0; i < num_rows; ++i) {
-            float max_val = *std::max_element(input.begin() + i * embedding_dim, input.begin() + (i + 1) * embedding_dim);
+            float max_val = *std::max_element(input.begin() + i * actual_dim, input.begin() + (i + 1) * actual_dim);
             float sum = 0.0f;
 
-            for (size_t j = 0; j < embedding_dim; ++j) {
-                size_t idx = i * embedding_dim + j;
+            for (size_t j = 0; j < actual_dim; ++j) {
+                size_t idx = i * actual_dim + j;
                 output[idx] = std::exp(input[idx] - max_val);
                 sum += output[idx];
             }
 
-            for (size_t j = 0; j < embedding_dim; ++j) {
-                size_t idx = i * embedding_dim + j;
+            for (size_t j = 0; j < actual_dim; ++j) {
+                size_t idx = i * actual_dim + j;
                 output[idx] /= sum;
             }
         }
@@ -105,4 +118,3 @@ std::vector<float> CPUMatrixOps::softmax(const std::vector<float>& input, size_t
         throw std::invalid_argument("Unsupported axis for softmax");
     }
 }
-
