@@ -83,7 +83,7 @@ TEST_F(MatrixOpsTest, ActivationFunctions) {
 
 // 测试层归一化
 TEST_F(MatrixOpsTest, LayerNorm) {
-    const std::vector<size_t> EMBEDDING_DIMS = {16, 32, 64, 128};
+    const std::vector<size_t> EMBEDDING_DIMS = {16, 32, 64, 128, 256, 1024};
     const std::vector<float> EPS_VALUES = {1e-5f, 1e-10f};
 
     for (size_t dim : EMBEDDING_DIMS) {

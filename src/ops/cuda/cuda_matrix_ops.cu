@@ -342,7 +342,7 @@ std::vector<float> CUDAMatrixOps::layer_norm(
     cudaMemcpy(d_gamma, gamma_ptr, gamma.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_beta, beta_ptr, beta.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 blockDim(256);
+    dim3 blockDim(1024);  // 每个block处理一个序列的所有特征
     dim3 gridDim(seq_len);  // 每个序列分配一个block
 
     // 修改核函数调用参数

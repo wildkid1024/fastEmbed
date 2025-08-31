@@ -62,6 +62,8 @@ TEST_F(AttentionOpsTest, MultiHeadAttention) {
     const std::vector<std::tuple<size_t, size_t, size_t>> PARAMS = {
         {10, 64, 4},   // seq_len=10, embed_dim=64, heads=4
         {10, 128, 8},  // seq_len=16, embed_dim=128, heads=8
+        {10, 512, 16},  // seq_len=10, embed_dim=512, heads=16
+        {10, 1024, 16},  // seq_len=10, embed_dim=1024, heads=16
     };
 
     for (const auto& [seq_len, embed_dim, num_heads] : PARAMS) {

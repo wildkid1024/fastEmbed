@@ -205,7 +205,7 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
 
     float *d_scores, *d_attn_output;
     cudaMalloc(&d_scores, batch_size * num_heads * seq_len * seq_len * sizeof(float));
-    cudaMalloc(&d_attn_output, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_attn_output, input_size);
     
     cublasSgemmStridedBatched(
         handle_, 
@@ -247,20 +247,23 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
         batch_size * num_heads
     );
 
-    unpermute_kernel<<<numBlocks, blockSize>>>(d_output, d_output, batch_size, seq_len, num_heads, head_dim);
+    unpermute_kernel<<<numBlocks, blockSize>>>(d_output, d_attn_output, batch_size, seq_len, num_heads, head_dim);
 
     // 释放中间内存
     cudaFree(d_scores);
+    cudaFree(d_preatt);
 
     // Copy result to host
     std::vector<float> output(input.size());
-    cudaMemcpy(output.data(), d_output, input_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(output.data(), d_attn_output, input_size, cudaMemcpyDeviceToHost);
 
     // Cleanup
     cudaFree(d_input); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
     cudaFree(d_wq); cudaFree(d_wk); cudaFree(d_wv);
     cudaFree(d_bq); cudaFree(d_bk); cudaFree(d_bv);
     cudaFree(d_output);
+    cudaFree(d_q_permuted); cudaFree(d_k_permuted); cudaFree(d_v_permuted);
+    
 
     return output;
 }
