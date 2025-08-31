@@ -27,26 +27,55 @@ BGETokenizer::BGETokenizer(const std::string& vocab_file) {
 std::vector<std::string> BGETokenizer::tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     std::string current_token;
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        uint8_t byte = static_cast<uint8_t>(c);
 
-    for (char c : text) {
         // 跳过空格
         if (isspace(c)) {
             if (!current_token.empty()) {
                 tokens.push_back(current_token);
                 current_token.clear();
             }
+            i++;
             continue;
         }
 
         // 判断是否为中文字符（Unicode：0x4E00-0x9FA5）
         bool is_chinese = (static_cast<uint8_t>(c) & 0x80) != 0;  // 非ASCII字符
         if (is_chinese) {
-            // 中文单字拆分：先保存当前token，再添加中文字符
+           // 判断UTF-8字节长度
+            int bytes_needed = 0;
+            if ((byte & 0xE0) == 0xC0) bytes_needed = 2;  // 双字节 (110xxxxx)
+            else if ((byte & 0xF0) == 0xE0) bytes_needed = 3;  // 三字节 (1110xxxx)
+            else if ((byte & 0xF8) == 0xF0) bytes_needed = 4;  // 四字节 (11110xxx)
+            else {  // 无效UTF-8首字节
+                tokens.push_back("[UNK]");
+                i++;
+                continue;
+            }
+
+            // 检查剩余字节是否足够
+            if (i + bytes_needed > text.size()) {
+                tokens.push_back("[UNK]");
+                i++;
+                continue;
+            }
+
+            // 提取完整UTF-8字符
+            std::string chinese_char;
+            for (int j = 0; j < bytes_needed; j++) {
+                chinese_char += text[i + j];
+            }
+            i += bytes_needed;
+
+            // 添加中文字符到分词结果
             if (!current_token.empty()) {
                 tokens.push_back(current_token);
                 current_token.clear();
             }
-            tokens.push_back(std::string(1, c));
+            tokens.push_back(chinese_char);
             continue;
         }
 
@@ -62,6 +91,7 @@ std::vector<std::string> BGETokenizer::tokenize(const std::string& text) {
             }
             tokens.push_back(std::string(1, c));
         }
+        i++;
     }
 
     // 添加最后一个未处理的token

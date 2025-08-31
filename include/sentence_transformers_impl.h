@@ -6,8 +6,8 @@
 #include "tokenizer.h"  // 引入 tokenizer 头文件
 
 // 移除未使用的CPU头文件
-// #include "ops/cpu/cpu_attention_ops.h"
-// #include "ops/cpu/cpu_matrix_ops.h"
+#include "ops/cpu/cpu_attention_ops.h"
+#include "ops/cpu/cpu_matrix_ops.h"
 
 #include "ops/cuda/cuda_matrix_ops.h"
 #include "ops/cuda/cuda_attention_cublas_ops.cuh"
@@ -22,8 +22,8 @@ private:
     std::unordered_map<std::string, std::vector<float>> weights;
     size_t embedding_dim;
     // 注释掉未使用的CPU实例
-    // CPUAttentionOps cpu_attention_ops; 
-    // CPUMatrixOps cpu_matrix_ops; 
+    CPUAttentionOps cpu_attention_ops; 
+    CPUMatrixOps cpu_matrix_ops; 
     // 添加CUDA操作类实例
     CUDAMatrixOps cuda_matrix_ops;
     CUDAAttentionOps cuda_attention_ops;
