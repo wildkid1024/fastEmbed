@@ -149,7 +149,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     // 应用嵌入层 LayerNorm（词嵌入 + 位置嵌入 + 段嵌入 后的归一化）
     const std::vector<float>& ln_weight = weights["embeddings.LayerNorm.weight"];
     const std::vector<float>& ln_bias = weights["embeddings.LayerNorm.bias"];
-    embedded = cpu_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim, epsilon);
+    embedded = cuda_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim, epsilon);
 
     // {{ 预训练位置嵌入处理结束 }}
     
@@ -197,12 +197,17 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
 
         int num_attention_heads = this->config["num_attention_heads"];
         // 多头注意力机制
-        // 修改多头注意力调用，传递偏置参数
-        std::vector<float> attn_output = multi_head_attention(embedded, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_attention_heads, embedding_dim);
+        // 修改多头注意力调用
+        std::vector<float> attn_output = multi_head_attention(
+        embedded, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias,
+        num_attention_heads, embedding_dim
+        );
         // {{ 新增：注意力输出 Dense 层（修复未使用 weight 的问题）}}
         // 3. 矩阵乘法：attn_output（[seq_len, embedding_dim]） × 权重（[embedding_dim, embedding_dim]）
         size_t batch_seq_len = attn_output.size() / embedding_dim;
-        attn_output = cpu_matrix_ops.matrix_multiply_transpose(attn_output, attn_dense_weight, batch_seq_len, embedding_dim, embedding_dim);
+        attn_output = cuda_matrix_ops.matrix_multiply_transpose(
+        attn_output, attn_dense_weight, batch_seq_len, embedding_dim, embedding_dim
+        );
         
         // 4. 叠加偏置
         for (size_t i = 0; i < attn_output.size(); ++i) {
@@ -216,7 +221,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         }
 
         // 层归一化
-        attn_output = cpu_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim, epsilon);
+        attn_output = cuda_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim, epsilon);
 
         const int intermediate_dim = this->config["intermediate_size"];
 
@@ -225,7 +230,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
             attn_output, 
             weight_ff_1, bias_ff_1, 
             weight_ff_2, bias_ff_2,
-            ln_ff_gamma, ln_ff_beta,  // 传递LayerNorm参数
+            ln_ff_gamma, ln_ff_beta, 
             embedding_dim, intermediate_dim,
             0.1f  // dropout概率
         );
@@ -334,7 +339,7 @@ std::vector<float> SentenceTransformerImpl::multi_head_attention(
     size_t embedding_dim
 ) {
     // 调用 CPUAttentionOps 的 multi_head_attention 方法
-    return cpu_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_heads, embedding_dim);
+    return cuda_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_heads, embedding_dim);
 }
 
 // 实现 SentenceTransformerImpl 的 feed_forward_network 函数
@@ -344,16 +349,16 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
                                                                   const std::vector<float>& bias_ff_1, 
                                                                   const std::vector<float>& weight_ff_2, 
                                                                   const std::vector<float>& bias_ff_2, 
-                                                                  const std::vector<float>& ln_gamma,  // 新增LayerNorm参数
-                                                                  const std::vector<float>& ln_beta,   // 新增LayerNorm参数
+                                                                  const std::vector<float>& ln_gamma,  
+                                                                  const std::vector<float>& ln_beta,   
                                                                   size_t embedding_dim, 
                                                                   size_t intermediate_dim,
-                                                                  float dropout_prob) {  // 新增dropout参数
+                                                                  float dropout_prob) {
     size_t batch_seq_len = input.size() / embedding_dim;
     const float epsilon = this->config["layer_norm_eps"];
 
-    // 第一层线性变换
-    std::vector<float> hidden = cpu_matrix_ops.matrix_multiply_transpose(
+    // 第一层线性变换 - 替换为CUDA矩阵乘
+    std::vector<float> hidden = cuda_matrix_ops.matrix_multiply_transpose(
         input, weight_ff_1, batch_seq_len, embedding_dim, intermediate_dim
     );
     
@@ -362,19 +367,19 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
         hidden[i] += bias_ff_1[i % intermediate_dim];
     }
 
-    // 激活函数
+    // 激活函数 - 替换为CUDA版本
     if (this->config["hidden_act"] == "gelu") {
-        hidden = cpu_matrix_ops.gelu(hidden);
+        hidden = cuda_matrix_ops.gelu(hidden);
     } else if (this->config["hidden_act"] == "relu") {
-        hidden = cpu_matrix_ops.relu(hidden);
+        hidden = cuda_matrix_ops.relu(hidden);
     } else if (this->config["hidden_act"] == "swish") {
-        hidden = cpu_matrix_ops.swish(hidden);
+        hidden = cuda_matrix_ops.swish(hidden);
     } else {
         throw std::runtime_error("Unsupported activation function");
     }
 
-    // 第二层线性变换
-    std::vector<float> output = cpu_matrix_ops.matrix_multiply_transpose(
+    // 第二层线性变换 - 替换为CUDA矩阵乘
+    std::vector<float> output = cuda_matrix_ops.matrix_multiply_transpose(
         hidden, weight_ff_2, batch_seq_len, intermediate_dim, embedding_dim
     );
     
@@ -383,14 +388,11 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
         output[i] += bias_ff_2[i % embedding_dim];
     }
 
-    // 添加Dropout层（需要在cpu_matrix_ops中实现）
-    // output = cpu_matrix_ops.dropout(output, dropout_prob);
-
-    // 残差连接 + LayerNorm（与PyTorch实现一致）
+    // 残差连接 + LayerNorm - 替换为CUDA层归一化
     for (size_t i = 0; i < output.size(); ++i) {
         output[i] += input[i];  // 残差连接
     }
-    output = cpu_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim, epsilon);  // 层归一化
+    output = cuda_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim, epsilon);
 
     return output;
 }

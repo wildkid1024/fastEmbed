@@ -5,11 +5,12 @@
 #include <nlohmann/json.hpp>
 #include "tokenizer.h"  // 引入 tokenizer 头文件
 
-#include "ops/cpu/cpu_attention_ops.h"
-#include "ops/cpu/cpu_matrix_ops.h"
+// 移除未使用的CPU头文件
+// #include "ops/cpu/cpu_attention_ops.h"
+// #include "ops/cpu/cpu_matrix_ops.h"
 
 #include "ops/cuda/cuda_matrix_ops.h"
-#include "ops/cuda/cuda_attention_ops.h"
+#include "ops/cuda/cuda_attention_cublas_ops.cuh"
 
 using json = nlohmann::json;
 
@@ -20,10 +21,12 @@ private:
     std::unordered_map<std::string, int64_t> vocab;
     std::unordered_map<std::string, std::vector<float>> weights;
     size_t embedding_dim;
-    // 定义 CPUAttentionOps 实例
-    CPUAttentionOps cpu_attention_ops; 
-    // 定义 CPUMatrixOps 实例
-    CPUMatrixOps cpu_matrix_ops; 
+    // 注释掉未使用的CPU实例
+    // CPUAttentionOps cpu_attention_ops; 
+    // CPUMatrixOps cpu_matrix_ops; 
+    // 添加CUDA操作类实例
+    CUDAMatrixOps cuda_matrix_ops;
+    CUDAAttentionOps cuda_attention_ops;
     nlohmann::json config;  // 添加 JSON 配置私有成员
 
     // Private helper functions
