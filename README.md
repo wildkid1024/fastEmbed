@@ -87,6 +87,55 @@ int main() {
 }
 ```
 
+
+### openai http Server 使用示例
+
+#### 编译
+```bash
+git submodule update --init --recursive
+mkdir build
+cd build
+cmake .. -DUSE_SERVER=ON -DUSE_CUDA=ON
+make -j
+```
+
+#### 命令行参数
+
+| 参数                | 描述                  | 默认值 |
+|---------------------|-----------------------|--------|
+| `--model_path`      | 模型文件路径          | 无     |
+| `--serve_model_name`| 服务模型名称          | 无     |
+| `--host`            | 服务绑定主机          | `0.0.0.0` |
+| `--port`            | 服务绑定端口          | `8080`  |
+| `--help`            | 显示帮助信息          | 无     |
+
+#### 服务端示例
+
+```bash
+# 基础用法
+./embedding_server --model_path /path/to/your/model --serve_model_name your-model-name
+
+# 查看帮助
+./embedding_server --help
+```
+
+#### 客户端示例
+
+```bash
+# 启动服务
+./embedding_server --model_path ./bge-small-zh-v1.5 --serve_model_name bge-small-zh
+
+# 测试单文本嵌入
+curl -X POST http://localhost:8080/v1/embeddings \ 
+  -H "Content-Type: application/json" \ 
+  -d '{"input": "这是一个测试句子", "model": "bge-small-zh"}'
+
+# 测试批量文本嵌入
+curl -X POST http://localhost:8080/v1/embeddings \ 
+  -H "Content-Type: application/json" \ 
+  -d '{"input": ["句子1", "句子2", "句子3"], "model": "bge-small-zh"}'
+```
+
 ## 🌍 跨平台支持
 - **Linux** 🐧: Ubuntu 18.04+, CentOS 7+
 - **Windows** 🪟: Windows 10+, Visual Studio 2019+

@@ -65,25 +65,9 @@ target_link_libraries(Cli_APP
     ${ADDITIONAL_LIBS}
 )
 
-if (USE_CUDA)
-    message(STATUS "Building with CUDA support")
-    target_link_libraries(Embedding_APP 
-        ${ADDITIONAL_LIBS}
-         CUDA::cublas
-    )
-    target_link_libraries(Cli_APP 
-        ${ADDITIONAL_LIBS}
-         CUDA::cublas
-    )
-else()
-    message(STATUS "Building without CUDA support")
-    target_link_libraries(Embedding_APP 
-        ${ADDITIONAL_LIBS}
-    )
-    target_link_libraries(Cli_APP 
-        ${ADDITIONAL_LIBS}
-    )
-endif()
+
+if(USE_TESTING)
+    message(STATUS "Building with tests")
 
 enable_testing()
 
@@ -145,3 +129,32 @@ else()
     )
 endif()
 add_test(NAME attention_ops_test COMMAND attention_ops_test)
+
+else()
+    message(STATUS "Building without tests")
+endif()
+
+if (USE_SERVER)
+    message(STATUS "Building with embedding server")
+
+    # 设置 Crow 库路径
+    set(CROW_DIR "${CMAKE_SOURCE_DIR}/third_party/crow")
+
+    # 确保 Crow 目录存在
+    if(NOT EXISTS ${CROW_DIR}/CMakeLists.txt)
+        message(FATAL_ERROR "Crow directory not found at ${CROW_DIR}. Please ensure Crow is cloned in the third_party directory.")
+    endif()
+
+# 添加Crow HTTP库
+add_subdirectory(${CROW_DIR})
+
+# 添加嵌入服务可执行文件
+add_executable(embedding_server embedding_server.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+
+target_link_libraries(embedding_server
+    PRIVATE
+       ${ADDITIONAL_LIBS}
+        Crow::Crow
+)
+
+endif()
