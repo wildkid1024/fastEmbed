@@ -50,12 +50,18 @@ endif()
 # Executable
 if(USE_CUDA)
     add_executable(Embedding_APP app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+    add_executable(Cli_APP cli_app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 else()
     add_executable(Embedding_APP app.cpp ${CPP_SOURCES})
+    add_executable(Cli_APP cli_app.cpp ${CPP_SOURCES})
 endif()
 
 
 target_link_libraries(Embedding_APP 
+    ${ADDITIONAL_LIBS}
+)
+
+target_link_libraries(Cli_APP 
     ${ADDITIONAL_LIBS}
 )
 
@@ -65,9 +71,16 @@ if (USE_CUDA)
         ${ADDITIONAL_LIBS}
          CUDA::cublas
     )
+    target_link_libraries(Cli_APP 
+        ${ADDITIONAL_LIBS}
+         CUDA::cublas
+    )
 else()
     message(STATUS "Building without CUDA support")
     target_link_libraries(Embedding_APP 
+        ${ADDITIONAL_LIBS}
+    )
+    target_link_libraries(Cli_APP 
         ${ADDITIONAL_LIBS}
     )
 endif()
