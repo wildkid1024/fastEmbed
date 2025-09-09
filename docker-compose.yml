@@ -1,19 +1,21 @@
-version: "3.9"
-
 services:
-  cuda-dev:
+  fastembed-svc:
     # 使用 build 指令通过 Dockerfile 构建镜像
-    image: cuda-cpp-build:v1.0.0
+    image: fastembed-server:v1.0.0-cuda
     build: .
-    container_name: cuda_cpp_build
+    container_name: fastembed-server
     # 使用宿主机网络
-    network_mode: host
+    ports:
+      - "5000:5000"
+    # network_mode: host
     volumes:
       - ./:/workspace/Embedding_app
+      - /home/wildkid1024/Models:/Models
     working_dir: /workspace/Embedding_app
     tty: true
     stdin_open: true
-    command: bash
+    # command: bash
+    command: ./build/embedding_server --model_path /Models/models-hf/sentence_models/bge-large-zh-v1.5/ --serve_model_name bge-large-zh-v1.5 --port 5000 
     # 设置 runtime 为 nvidia
     runtime: nvidia
     deploy:
