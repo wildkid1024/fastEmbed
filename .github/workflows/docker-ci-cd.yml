@@ -43,8 +43,8 @@ jobs:
           context: .
           push: ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' }}
           tags: |
-            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && format('{0}/fastembed-server:{1}', secrets.DOCKERHUB_USERNAME, github.sha) || 'fastembed-server:local' }}
-            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && format('{0}/fastembed-server:latest', secrets.DOCKERHUB_USERNAME) || '' }}
+            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && 'wildkid1024/fastembed-server:${{ github.sha }}' || 'fastembed-server:local' }}
+            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && 'wildkid1024/fastembed-server:latest' || '' }}
           build-args: |
             USE_CUDA=ON
             USE_SERVER=ON
