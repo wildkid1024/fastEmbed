@@ -1,0 +1,31 @@
+#ifndef CUDA_ATTENTION_OPS_H
+#define CUDA_ATTENTION_OPS_H
+
+#include "attention_ops_interface.h"
+#include "cuda_matrix_ops.h"
+#include <memory>
+
+class CUDAMatrixOps;
+
+class CUDAAttentionOps {
+public:
+    CUDAAttentionOps();
+    ~CUDAAttentionOps() = default;
+
+    std::vector<float> multi_head_attention(
+        const std::vector<float>& input,
+        const std::vector<float>& weight_q,
+        const std::vector<float>& weight_k,
+        const std::vector<float>& weight_v,
+        const std::vector<float>& query_bias,
+        const std::vector<float>& key_bias,
+        const std::vector<float>& value_bias,
+        size_t num_heads,
+        size_t embedding_dim
+    );
+
+private:
+    std::unique_ptr<CUDAMatrixOps> cuda_matrix_ops;
+};
+
+#endif // CUDA_ATTENTION_OPS_H
