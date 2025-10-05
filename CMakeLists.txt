@@ -9,6 +9,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 添加选项，默认不使用 CUDA
 option(USE_CUDA "Use CUDA for acceleration" OFF)
 
+# 添加选项，默认使用 cuBLAS 进行矩阵计算
+option(USE_CUBLAS "Use cuBLAS for matrix operations" OFF)
+
+# 添加选项，默认不启用测试
+option(ENABLE_TESTS "Enable unit tests" OFF)
+
+# 添加选项，默认不启用嵌入服务
+option(ENABLE_SERVER "Enable embedding service" OFF)
+
+
 
 if(USE_CUDA)
     # Enable CUDA support
@@ -18,7 +28,11 @@ if(USE_CUDA)
     find_package(CUDA REQUIRED)
 
     # Set policy to suppress CMP0146 warning
-    cmake_policy(SET CMP0146 NEW)
+    # cmake_policy(SET CMP0146 NEW)
+    cmake_policy(SET CMP0146 OLD) 
+
+    # 设置 CUDA 架构
+    set(CMAKE_CUDA_ARCHITECTURES native)
 
     # Find CUDA Toolkit (modern CMake)
     find_package(CUDAToolkit REQUIRED)
@@ -26,15 +40,30 @@ if(USE_CUDA)
     # Set CUDA architecture and compiler flags
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -arch=sm_75")
 
-    # Source files
-    file(GLOB_RECURSE CUDA_SOURCES "src/ops/cuda/*.cu")
+    # 根据是否使用 cuBLAS 分类源文件
+    if(USE_CUBLAS)
+        message(STATUS "Building with cuBLAS support")
+        # 使用 cuBLAS 的 CUDA 源文件
+        file(GLOB CUDA_BASE_SOURCES "src/ops/cuda/cuda_matrix_ops.cu")
+        file(GLOB CUDA_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_cublas_ops.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES})
+        # 添加 cuBLAS 库
+        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas)
+    else()
+        message(STATUS "Building without cuBLAS support")
+        # 不使用 cuBLAS 的 CUDA 源文件
+        file(GLOB CUDA_BASE_SOURCES "src/ops/cuda/cuda_matrix_ops.cu")
+        file(GLOB CUDA_NON_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_ops.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES})
+        # 不添加 cuBLAS 库
+        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES})
+    endif()
+    
+    # C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cuda/*.cpp")
 
     # Include directories
     include_directories(${CUDA_INCLUDE_DIRS} include include/ops)
-
-    # Link libraries
-    set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas)
 else()
     # 仅查找非 CUDA 相关的 C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cpu/*.cpp")
@@ -49,24 +78,24 @@ endif()
 
 # Executable
 if(USE_CUDA)
-    add_executable(Embedding_APP app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
-    add_executable(Cli_APP cli_app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+    add_executable(app app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+    add_executable(cli cli_app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 else()
-    add_executable(Embedding_APP app.cpp ${CPP_SOURCES})
-    add_executable(Cli_APP cli_app.cpp ${CPP_SOURCES})
+    add_executable(app app.cpp ${CPP_SOURCES})
+    add_executable(cli cli_app.cpp ${CPP_SOURCES})
 endif()
 
 
-target_link_libraries(Embedding_APP 
+target_link_libraries(app 
     ${ADDITIONAL_LIBS}
 )
 
-target_link_libraries(Cli_APP 
+target_link_libraries(cli 
     ${ADDITIONAL_LIBS}
 )
 
 
-if(USE_TESTING)
+if(ENABLE_TESTS)
     message(STATUS "Building with tests")
 
 enable_testing()
@@ -89,6 +118,18 @@ if(USE_CUDA)
     )
     target_include_directories(cuda_matrix_ops PUBLIC include/ops/cuda)
     set_target_properties(cuda_matrix_ops PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    
+    # 根据是否使用 cuBLAS 添加相应的注意力操作源文件
+    if(USE_CUBLAS)
+        target_sources(cuda_matrix_ops PRIVATE
+            src/ops/cuda/cuda_attention_cublas_ops.cu
+        )
+    else()
+        target_sources(cuda_matrix_ops PRIVATE
+            src/ops/cuda/cuda_attention_ops.cu
+        )
+    endif()
+    
     # Add attention ops sources to CPU library
     target_sources(cpu_matrix_ops PRIVATE
         src/ops/cpu/cpu_attention_ops.cpp
@@ -112,7 +153,7 @@ endif()
 add_test(NAME matrix_ops_test COMMAND matrix_ops_test)
 
 # 添加注意力操作测试
-add_executable(attention_ops_test tests/attention_ops_test.cpp src/ops/cuda/cuda_attention_cublas_ops.cu)
+add_executable(attention_ops_test tests/attention_ops_test.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 if(USE_CUDA)
     target_link_libraries(attention_ops_test
         GTest::GTest GTest::Main
@@ -125,7 +166,7 @@ else()
         GTest::GTest
         GTest::Main
         cpu_matrix_ops
-        $<$<BOOL:${USE_CUDA}>:cuda_matrix_ops>
+        cuda_matrix_ops
     )
 endif()
 add_test(NAME attention_ops_test COMMAND attention_ops_test)
@@ -134,7 +175,7 @@ else()
     message(STATUS "Building without tests")
 endif()
 
-if (USE_SERVER)
+if (ENABLE_SERVER)
     message(STATUS "Building with embedding server")
 
     # 设置 Crow 库路径
@@ -149,9 +190,9 @@ if (USE_SERVER)
 add_subdirectory(${CROW_DIR})
 
 # 添加嵌入服务可执行文件
-add_executable(embedding_server embedding_server.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+add_executable(server embedding_server.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 
-target_link_libraries(embedding_server
+target_link_libraries(server
     PRIVATE
        ${ADDITIONAL_LIBS}
         Crow::Crow
