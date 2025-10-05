@@ -2,7 +2,11 @@
 #include <random>
 #include <cmath>
 #include "ops/cpu/cpu_attention_ops.h"
+#ifdef USE_CUBLAS
 #include "ops/cuda/cuda_attention_cublas_ops.cuh"
+#else
+#include "ops/cuda/cuda_attention_ops.cuh"
+#endif
 #include <gtest/gtest.h>
 
 // 测试参数配置

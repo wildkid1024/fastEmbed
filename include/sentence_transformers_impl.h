@@ -10,7 +10,7 @@
 #include "ops/cpu/cpu_matrix_ops.h"
 
 #include "ops/cuda/cuda_matrix_ops.h"
-#include "ops/cuda/cuda_attention_cublas_ops.cuh"
+#include "ops/cuda/cuda_attention_ops.cuh"
 
 using json = nlohmann::json;
 
