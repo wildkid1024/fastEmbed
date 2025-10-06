@@ -71,7 +71,7 @@ private:
 
 public:
     // 支持两种构造函数，一种用于传统BGE模型，一种用于BGE-M3模型
-    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path, ModelType type = ModelType::BGE_M3);
+    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
     std::vector<float> encode(const std::string& text);
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
     size_t get_embedding_dimension() const;
