@@ -7,6 +7,13 @@
 4. [x] 增加从命令行参数加载问题
 5. [x] 增加openai http API支持
 6. [x] 增加docker及compose支持
-7. 多batch分词的截断和padding
-8. 增加版本号控制和自动cicd
-9. 支持bge-m3模型
+7. [ ] 分词的截断和padding支持
+8. [ ] 多batch推理支持
+9. [x] 增加版本号控制和自动cicd
+10. [x] 支持bge-m3模型
+11. [x] 动态支持bge-m3和bge-large-zh-v1.5模型
+12. [ ] 海光/AMD HIP支持
+13. [ ] 增加benchmark,对比不同模型的推理速度
+14. [ ] 支持Qwen3-embedding模型
+15. [ ] 支持rpc调用
+16. [ ] fastattn调用优化
