@@ -1,8 +1,9 @@
-from transformers import BertModel, BertTokenizer
+from transformers import BertModel, BertTokenizer, XLMRobertaModel, XLMRobertaTokenizer
 import torch
 from sentence_transformers import SentenceTransformer
 
 def main():
+    """
     model_path = "/home/wildkid1024/Public/Models/bge-small-zh-v1.5"
     tokenizer = BertTokenizer.from_pretrained(model_path)
     model = BertModel.from_pretrained(
@@ -12,7 +13,16 @@ def main():
         torchscript=False
     )
     model.eval()
-
+    """
+    model_path = "/home/wildkid1024/Models/BAAI/bge-m3/"
+    tokenizer = XLMRobertaTokenizer.from_pretrained(model_path)
+    model = XLMRobertaModel.from_pretrained(
+        model_path,
+        output_hidden_states=True,
+        output_attentions=True,
+        torchscript=False
+    )
+    model.eval()
     print(model)
 
     # ==== 1. 输入文本（与 C++ 保持一致，避免 [UNK]）====
@@ -62,11 +72,11 @@ def main():
     print(f"形状: {output.pooler_output.shape}")  # 应为 (batch_size, seq_len, hidden_size)，如 (1, 5, 384)
     print(output.pooler_output)  # 展平为一维向量，保留6位小数
 
-
 def test_sentence_transformers():
     from sentence_transformers.models.Pooling import Pooling
     from sentence_transformers.models.Normalize import Normalize
-    model = SentenceTransformer("/home/wildkid1024/Public/Models/bge-large-zh-v1.5")
+    model_path = "/home/wildkid1024/Models/BAAI/bge-m3/"
+    model = SentenceTransformer(model_path)
     print(model)
     texts = ["This is a test sentence.","Another example sentence."]  # 使用中文确保分词一致
     embedding = model.encode(texts)
@@ -76,11 +86,14 @@ def trans_torch_to_safetensors():
     from safetensors.torch import save_file
     import torch
 
-    model_path = '/home/wildkid1024/Public/Models/bge-large-zh-v1.5'
+    # model_path = '/home/wildkid1024/Public/Models/bge-large-zh-v1.5'
+    # model_path = '/home/wildkid1024/Models/models-hf/sentence_models/bge-large-zh-v1.5'
+    model_path = '/home/wildkid1024/Models/BAAI/bge-m3/'
     state_dict = torch.load(f"{model_path}/pytorch_model.bin", map_location="cpu")
     save_file(state_dict, f"{model_path}/model.safetensors")
     print("Safetensors 文件已保存")
 
 if __name__ == "__main__":
+    # main()
     test_sentence_transformers()
     # trans_torch_to_safetensors()

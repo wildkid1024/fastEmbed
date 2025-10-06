@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <memory>
+#include <unordered_map>
 #include <sentencepiece_processor.h>
 #include <nlohmann/json.hpp>
 #include "tokenizer.h"  // 引入 tokenizer 头文件
@@ -14,10 +16,19 @@
 
 using json = nlohmann::json;
 
+// 模型类型枚举
+enum class ModelType {
+    BGE,
+    BGE_M3
+};
+
 class SentenceTransformerImpl {
 private:
-    // 假设使用之前实现的 BGETokenizer
-    BGETokenizer tokenizer; 
+    // 支持两种分词器
+    ModelType model_type;
+    std::unique_ptr<BGETokenizer> bge_tokenizer;
+    std::unique_ptr<XLMRobertaTokenizer> xlmr_tokenizer;
+    
     std::unordered_map<std::string, int64_t> vocab;
     std::unordered_map<std::string, std::vector<float>> weights;
     size_t embedding_dim;
@@ -30,7 +41,7 @@ private:
     nlohmann::json config;  // 添加 JSON 配置私有成员
 
     // Private helper functions
-    void load_vocab(const std::string& config_path);
+    // void load_vocab(const std::string& config_path);
     std::vector<int32_t> tokenize(const std::string& text);
     std::vector<float> embedding_layer(const std::vector<int32_t>& tokens);
     std::vector<float> add_position_encoding(const std::vector<float>& input, size_t seq_len, size_t embedding_dim);
@@ -59,7 +70,8 @@ private:
     std::vector<float> bge_forward(const std::vector<int32_t>& tokens);
 
 public:
-    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
+    // 支持两种构造函数，一种用于传统BGE模型，一种用于BGE-M3模型
+    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path, ModelType type = ModelType::BGE_M3);
     std::vector<float> encode(const std::string& text);
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
     size_t get_embedding_dimension() const;

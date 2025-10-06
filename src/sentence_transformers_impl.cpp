@@ -6,35 +6,23 @@
 #include <cmath>
 #include <iostream>
 
-// 从 config.json 加载词汇表
-void SentenceTransformerImpl::load_vocab(const std::string& config_path) {
-    std::ifstream config_file(config_path);
-    if (!config_file.is_open()) {
-        throw std::runtime_error("无法打开 tokenizer.json 文件: " + config_path);
-    }
-
-    nlohmann::json config;
-    config_file >> config;
-
-    config = config["model"];
-    
-    if (config.contains("vocab") && config["vocab"].is_object()) {
-        for (auto& [key, value] : config["vocab"].items()) {
-            if (value.is_number_integer()) {
-                vocab[key] = value.get<int64_t>();
-            }
-        }
-    } else {
-        throw std::runtime_error("tokenizer.json 中未找到有效的词汇表字段");
-    }
-}
 
 // 使用新的 tokenizer 进行分词
 std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) {
-    auto tokens = tokenizer.tokenize(text);
-    auto token_ids = tokenizer.encode(tokens);
-    token_ids.insert(token_ids.begin(), 101);
-    token_ids.push_back(102);
+    std::vector<int> token_ids;
+    if (model_type == ModelType::BGE_M3 && xlmr_tokenizer) {
+        // 使用XLMRobertaTokenizer进行分词
+        auto tokens = xlmr_tokenizer->tokenize(text);
+        token_ids = xlmr_tokenizer->encode(tokens);
+    } else if (bge_tokenizer) {
+        // 使用BGETokenizer进行分词
+        auto tokens = bge_tokenizer->tokenize(text);
+        token_ids = bge_tokenizer->encode(tokens);
+        token_ids.insert(token_ids.begin(), 101);
+        token_ids.push_back(102);
+    } else {
+        throw std::runtime_error("未初始化分词器");
+    }
     return std::vector<int32_t>(token_ids.begin(), token_ids.end());
 }
 
@@ -55,26 +43,34 @@ std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<in
     return output;
 }
 
-SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path)
-    : tokenizer(tokenizer_path + "/vocab.txt") { // 假设词汇表文件在 model_path 下
-    // 加载词汇表
-
-    std::string tokenizer_model_path = tokenizer_path + "/tokenizer.model";  // Replace with the actual way to get tokenizer_path
-    std::string tokenizer_config_path = tokenizer_path + "/tokenizer.json";       // Replace with the actual way to get config_path
-    load_vocab(tokenizer_config_path);
+SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path, ModelType type)
+    : model_type(type) {
+    
+    // 根据模型类型初始化不同的分词器
+    if (model_type == ModelType::BGE_M3) {
+        // BGE-M3模型使用XLMRobertaTokenizer
+        std::string tokenizer_json_path = tokenizer_path + "/tokenizer.json";
+        std::string sentencepiece_model_path = tokenizer_path + "/sentencepiece.bpe.model";
+        xlmr_tokenizer = std::make_unique<XLMRobertaTokenizer>(tokenizer_json_path, sentencepiece_model_path);
+        // load_vocab(tokenizer_json_path);
+    } else {
+        // 传统BGE模型使用BGETokenizer
+        bge_tokenizer = std::make_unique<BGETokenizer>(tokenizer_path + "/vocab.txt");
+        std::string tokenizer_config_path = tokenizer_path + "/tokenizer.json";
+        // load_vocab(tokenizer_config_path);
+    }
 
     std::string tensor_path = model_path + "/model.safetensors";
     std::string config_path = model_path + "/config.json";
 
-    //  加载config_path到私有的config
+    // 加载config_path到私有的config
     std::ifstream config_file(config_path);
     if (!config_file.is_open()) {
         throw std::runtime_error("无法打开 config.json 文件: " + config_path);
     }
 
     // 移除局部变量，使用类成员变量
-    nlohmann::json config;
-    config_file >> this->config;  // 或直接使用 config
+    config_file >> this->config;
 
     if (!load_single_safetensors_file(tensor_path, weights)) {  // 使用函数
         throw std::runtime_error("加载模型权重失败");
@@ -86,15 +82,41 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
     }
 
     // 假设嵌入层权重名为 "embedding.weight"
+    const int vocab_size = config["vocab_size"];
     if (weights.find("embeddings.word_embeddings.weight") != weights.end()) {
         // 假设嵌入维度是权重矩阵的列数
-        embedding_dim = weights["embeddings.word_embeddings.weight"].size() / vocab.size();
+        embedding_dim = weights["embeddings.word_embeddings.weight"].size() / vocab_size;
         // 打印vocab size 和 embedding_dim
-        std::cout << "vocab size: " << vocab.size() << std::endl;
+        std::cout << "vocab size: " << vocab_size << std::endl;
         std::cout << "embedding_dim: " << embedding_dim << std::endl;
     } else {
         throw std::runtime_error("未找到嵌入层权重");
     }
+}
+
+
+// 辅助函数：根据输入ID动态生成位置ID
+std::vector<std::vector<int>> create_position_ids_from_input_ids(
+    const std::vector<std::vector<int>>& input_ids, 
+    int padding_idx = 0) {
+    std::vector<std::vector<int>> position_ids;
+    position_ids.reserve(input_ids.size());
+    
+    for (const auto& seq : input_ids) {
+        std::vector<int> pos_ids(seq.size(), 0);
+        int pos = 2; // 从1开始编号（假设0是padding_idx）
+        
+        for (size_t i = 0; i < seq.size(); ++i) {
+            if (seq[i] != padding_idx) {
+                pos_ids[i] = pos++; // 有效token连续编号
+            }
+            // padding token保持为0
+        }
+        
+        position_ids.push_back(pos_ids);
+    }
+    
+    return position_ids;
 }
 
 // 完整的 BGE 前向传播
@@ -112,14 +134,26 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     if (seq_len > max_seq_len) {
         throw std::runtime_error("序列长度超过位置嵌入的最大长度");
     }
-    
-    // 词嵌入 + 位置嵌入
-    for (size_t i = 0; i < seq_len; ++i) {
-        size_t pos_start = i * embedding_dim;
-        for (size_t j = 0; j < embedding_dim; ++j) {
-            embedded[pos_start + j] += pos_embeddings[pos_start + j];
+
+    // 如果模型是bge-m3，动态生成pos_ids
+    if (model_type == ModelType::BGE_M3) {
+        std::vector<std::vector<int>> position_ids = create_position_ids_from_input_ids({tokens}, this->config["pad_token_id"]);
+        for (size_t i = 0; i < seq_len; ++i) {
+            size_t pos_start = i * embedding_dim;
+            for (size_t j = 0; j < embedding_dim; ++j) {
+                embedded[pos_start + j] += pos_embeddings[position_ids[0][i] * embedding_dim + j];
+            }
         }
-    }
+    }else{
+        // 词嵌入 + 位置嵌入
+        for (size_t i = 0; i < seq_len; ++i) {
+            size_t pos_start = i * embedding_dim;
+            for (size_t j = 0; j < embedding_dim; ++j) {
+                embedded[pos_start + j] += pos_embeddings[pos_start + j];
+            }
+        }
+    }   
+    
     
     // {{ 新增：添加 token type 嵌入（段嵌入）}}
     // 1. 检查段嵌入权重是否存在

@@ -171,3 +171,153 @@ std::string BGETokenizer::decode(const std::vector<int>& token_ids) {
     }
     return text;
 }
+
+// XLMRobertaTokenizer implementation
+XLMRobertaTokenizer::XLMRobertaTokenizer(const std::string& tokenizer_json_path, const std::string& sentencepiece_model_path) {
+    // 1. 初始化SentencePiece处理器
+    sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+    auto status = sp_processor->Load(sentencepiece_model_path);
+    if (!status.ok()) {
+        throw std::runtime_error("无法加载SentencePiece模型: " + status.ToString());
+    }
+    
+    // 2. 从tokenizer.json加载词汇表和特殊token信息
+    std::ifstream tokenizer_file(tokenizer_json_path);
+    if (!tokenizer_file.is_open()) {
+        throw std::runtime_error("无法打开tokenizer.json文件: " + tokenizer_json_path);
+    }
+    
+    nlohmann::json tokenizer_config;
+    tokenizer_file >> tokenizer_config;
+    
+    // 3. 加载词汇表
+     if (tokenizer_config.contains("model") && tokenizer_config["model"].contains("vocab")) {
+        const auto& vocab_json = tokenizer_config["model"]["vocab"];
+        
+        if (vocab_json.is_array()) {
+            // 数组格式: [ [token1, score1], [token2, score2], ... ]
+            int id = 0;
+            for (const auto& item : vocab_json) {
+                if (item.is_array() && item.size() >= 1 && item[0].is_string()) {
+                    std::string token = item[0].get<std::string>();
+                    vocab[token] = id;
+                    id_to_token[id] = token;
+                    id++;
+                }
+            }
+        } else if (vocab_json.is_object()) {
+            // 兼容旧的对象格式
+            for (auto& [key, value] : vocab_json.items()) {
+                if (value.is_number_integer()) {
+                    vocab[key] = value.get<int>();
+                    id_to_token[value.get<int>()] = key;
+                }
+            }
+        }
+    }
+    
+    // 4. 设置特殊token ID
+    if (tokenizer_config.contains("bos_token_id")) {
+        bos_token_id = tokenizer_config["bos_token_id"].get<int>();
+    } else {
+        bos_token_id = 0; // 默认值，通常为0
+    }
+    
+    if (tokenizer_config.contains("eos_token_id")) {
+        eos_token_id = tokenizer_config["eos_token_id"].get<int>();
+    } else {
+        eos_token_id = 2; // 默认值，通常为2
+    }
+    
+    if (tokenizer_config.contains("unk_token_id")) {
+        unk_token_id = tokenizer_config["unk_token_id"].get<int>();
+    } else {
+        unk_token_id = 3; // 默认值，通常为3
+    }
+    
+    if (tokenizer_config.contains("pad_token_id")) {
+        pad_token_id = tokenizer_config["pad_token_id"].get<int>();
+    } else {
+        pad_token_id = unk_token_id; // 默认使用unk_token_id作为pad_token_id
+    }
+}
+
+std::vector<std::string> XLMRobertaTokenizer::tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::vector<std::string> sp_tokens;
+    
+    // 使用SentencePiece进行分词
+    auto status = sp_processor->Encode(text, &sp_tokens);
+    if (!status.ok()) {
+        throw std::runtime_error("SentencePiece分词失败: " + status.ToString());
+    }
+    
+    // 处理特殊token，移除可能的<s>和</s>
+    for (const auto& token : sp_tokens) {
+        if (token != "<s>" && token != "</s>") {
+            tokens.push_back(token);
+        }
+    }
+    
+    return tokens;
+}
+
+std::vector<int> XLMRobertaTokenizer::encode(const std::vector<std::string>& tokens) {
+    std::vector<int> token_ids;
+    
+    // 添加开始token
+    token_ids.push_back(bos_token_id);
+    
+    // 将tokens转换为ID
+    for (const auto& token : tokens) {
+        // 尝试直接在词汇表中查找
+        auto it = vocab.find(token);
+        if (it != vocab.end()) {
+            token_ids.push_back(it->second);
+        } else {
+            // 如果找不到，使用SentencePiece处理器获取ID
+            std::vector<int> sp_ids;
+            auto status = sp_processor->Encode({token}, &sp_ids);
+            if (!status.ok() || sp_ids.empty()) {
+                // 如果仍然失败，使用unk_token_id
+                token_ids.push_back(unk_token_id);
+            } else {
+                // 添加SentencePiece生成的ID
+                for (int id : sp_ids) {
+                    token_ids.push_back(id);
+                }
+            }
+        }
+    }
+    
+    // 添加结束token
+    token_ids.push_back(eos_token_id);
+    
+    // 打印token_ids以进行调试
+    std::cout << "Token IDs: ";
+    for (int id : token_ids) {
+        std::cout << id << " ";
+    }
+    std::cout << std::endl;
+    
+    return token_ids;
+}
+
+std::string XLMRobertaTokenizer::decode(const std::vector<int>& token_ids) {
+    std::string text;
+    
+    // 使用SentencePiece处理器进行解码
+    auto status = sp_processor->Decode(token_ids, &text);
+    if (!status.ok()) {
+        // 如果解码失败，尝试手动解码
+        for (int id : token_ids) {
+            if (id_to_token.find(id) != id_to_token.end()) {
+                text += id_to_token[id];
+            } else {
+                text += "<unk>";
+            }
+        }
+    }
+    
+    return text;
+}

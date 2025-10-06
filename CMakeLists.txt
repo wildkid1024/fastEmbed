@@ -5,7 +5,6 @@ project(Embedding_APP)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-
 # 添加选项，默认不使用 CUDA
 option(USE_CUDA "Use CUDA for acceleration" OFF)
 
@@ -18,9 +17,21 @@ option(ENABLE_TESTS "Enable unit tests" OFF)
 # 添加选项，默认不启用嵌入服务
 option(ENABLE_SERVER "Enable embedding service" OFF)
 
+# 查找 sentencepiece 库 - 简化版本，只链接必要的库
+find_library(SENTENCEPIECE_LIBRARY NAMES sentencepiece libsentencepiece)
+find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
+
+if(NOT SENTENCEPIECE_LIBRARY OR NOT SENTENCEPIECE_INCLUDE_DIR)
+    message(FATAL_ERROR "sentencepiece 库未找到，请安装 libsentencepiece-dev")
+endif()
+
+# 只使用 sentencepiece 库，不需要 sentencepiece_train
+set(SENTENCEPIECE_LIBRARIES ${SENTENCEPIECE_LIBRARY})
 
 
 if(USE_CUDA)
+    cmake_policy(SET CMP0146 OLD) 
+
     # Enable CUDA support
     enable_language(CUDA)
 
@@ -29,10 +40,9 @@ if(USE_CUDA)
 
     # Set policy to suppress CMP0146 warning
     # cmake_policy(SET CMP0146 NEW)
-    cmake_policy(SET CMP0146 OLD) 
 
     # 设置 CUDA 架构
-    set(CMAKE_CUDA_ARCHITECTURES native)
+    set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 89 90)
 
     # Find CUDA Toolkit (modern CMake)
     find_package(CUDAToolkit REQUIRED)
@@ -48,7 +58,7 @@ if(USE_CUDA)
         file(GLOB CUDA_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_cublas_ops.cu")
         set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES})
         # 添加 cuBLAS 库
-        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas)
+        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas ${SENTENCEPIECE_LIBRARIES})
     else()
         message(STATUS "Building without cuBLAS support")
         # 不使用 cuBLAS 的 CUDA 源文件
@@ -56,24 +66,24 @@ if(USE_CUDA)
         file(GLOB CUDA_NON_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_ops.cu")
         set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES})
         # 不添加 cuBLAS 库
-        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES})
+        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} ${SENTENCEPIECE_LIBRARIES})
     endif()
     
     # C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cuda/*.cpp")
 
     # Include directories
-    include_directories(${CUDA_INCLUDE_DIRS} include include/ops)
+    include_directories(${CUDA_INCLUDE_DIRS} include include/ops ${SENTENCEPIECE_INCLUDE_DIR})
 else()
     # 仅查找非 CUDA 相关的 C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cpu/*.cpp")
     # list(FILTER CPP_SOURCES EXCLUDE REGEX "src/ops/cpu/.*\\.cpp")
 
     # Include directories
-    include_directories(include include/ops)
+    include_directories(include include/ops ${SENTENCEPIECE_INCLUDE_DIR})
 
-    # 不添加额外库
-    set(ADDITIONAL_LIBS "")
+    # 添加 sentencepiece 库
+    set(ADDITIONAL_LIBS ${SENTENCEPIECE_LIBRARIES})
 endif()
 
 # Executable
@@ -85,13 +95,38 @@ else()
     add_executable(cli cli_app.cpp ${CPP_SOURCES})
 endif()
 
+# 查找并链接 nlohmann_json 库
+find_package(nlohmann_json REQUIRED)
 
+# 链接库
 target_link_libraries(app 
     ${ADDITIONAL_LIBS}
+    nlohmann_json::nlohmann_json
 )
 
 target_link_libraries(cli 
     ${ADDITIONAL_LIBS}
+    nlohmann_json::nlohmann_json
+)
+
+
+# 添加 nlohmann_json 库支持（如果需要）
+find_package(nlohmann_json REQUIRED)
+
+# 添加 safetensors 库支持（如果需要）
+# find_package(safetensors REQUIRED)
+
+# 链接库
+target_link_libraries(app 
+    ${ADDITIONAL_LIBS}
+    nlohmann_json::nlohmann_json
+    # safetensors::safetensors
+)
+
+target_link_libraries(cli 
+    ${ADDITIONAL_LIBS}
+    nlohmann_json::nlohmann_json
+    # safetensors::safetensors
 )
 
 
