@@ -1,8 +1,12 @@
 name: Docker CI/CD
 
-# 触发条件：仅手动触发
+# 触发条件：手动触发或标签推送
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
 jobs:
   build-and-push:
@@ -22,20 +26,36 @@ jobs:
       - name: Set image tags
         id: set_tags
         run: |
+          # 获取当前事件类型和标签信息
+          EVENT_TYPE="${{ github.event_name }}"
+          
           # 设置默认本地标签
           IMAGE_TAG_LOCAL="fastembed-server:local"
           echo "IMAGE_TAG_LOCAL=$IMAGE_TAG_LOCAL" >> $GITHUB_ENV
           
-          # 检查DockerHub token是否可用并相应设置标签
+          # 检查DockerHub token是否可用
           if [[ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]]; then
-            # 设置带有提交SHA和latest的DockerHub标签
-            IMAGE_TAG_SHA="wildkid1024/fastembed-server:${GITHUB_SHA}"
-            IMAGE_TAG_LATEST="wildkid1024/fastembed-server:latest"
-            echo "IMAGE_TAG_SHA=$IMAGE_TAG_SHA" >> $GITHUB_ENV
-            echo "IMAGE_TAG_LATEST=$IMAGE_TAG_LATEST" >> $GITHUB_ENV
             echo "DOCKERHUB_CREDENTIALS_AVAILABLE=true" >> $GITHUB_ENV
+            
+            # 如果是标签触发的构建，则添加版本号标签
+            if [[ "$EVENT_TYPE" == "push" && -n "${{ github.ref }}" ]]; then
+              # 从标签引用中提取版本号（如从refs/tags/v0.1.0提取v0.1.0）
+              TAG_NAME="${GITHUB_REF#refs/tags/}"
+              
+              # 设置版本标签（只保留带v的标签）
+              IMAGE_TAG_VERSION="wildkid1024/fastembed-server:$TAG_NAME"
+              
+              echo "IMAGE_TAG_VERSION=$IMAGE_TAG_VERSION" >> $GITHUB_ENV
+              echo "VERSION_TAG_EXISTS=true" >> $GITHUB_ENV
+            else
+              # 非标签触发时，设置latest标签
+              IMAGE_TAG_LATEST="wildkid1024/fastembed-server:latest"
+              echo "IMAGE_TAG_LATEST=$IMAGE_TAG_LATEST" >> $GITHUB_ENV
+              echo "VERSION_TAG_EXISTS=false" >> $GITHUB_ENV
+            fi
           else
             echo "DOCKERHUB_CREDENTIALS_AVAILABLE=false" >> $GITHUB_ENV
+            echo "VERSION_TAG_EXISTS=false" >> $GITHUB_ENV
           fi
 
       # 步骤4：登录到DockerHub（仅当凭证可用时）
@@ -53,18 +73,27 @@ jobs:
           context: .
           push: ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' }}
           tags: |
-            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && env.IMAGE_TAG_SHA || env.IMAGE_TAG_LOCAL }}
-            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && env.IMAGE_TAG_LATEST || '' }}
+            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && env.VERSION_TAG_EXISTS == 'true' && env.IMAGE_TAG_VERSION || '' }}
+            ${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE == 'true' && env.VERSION_TAG_EXISTS == 'false' && env.IMAGE_TAG_LATEST || '' }}
           build-args: |
             USE_CUDA=ON
-            USE_SERVER=ON
+            USE_CUBLAS=OFF
+            ENABLE_TESTS=OFF
+            ENABLE_SERVER=ON
+            CROW_BUILD_EXAMPLES=OFF
+            CROW_BUILD_TESTS=OFF
 
       # 步骤6：显示构建结果信息
       - name: Show build result
         run: |
           if [[ "${{ env.DOCKERHUB_CREDENTIALS_AVAILABLE }}" == "true" ]]; then
             echo "✅ Docker镜像已构建并推送到DockerHub：wildkid1024/fastembed-server"
-            echo "   标签：${{ env.IMAGE_TAG_SHA }}, ${{ env.IMAGE_TAG_LATEST }}"
+            
+            if [[ "${{ env.VERSION_TAG_EXISTS }}" == "true" ]]; then
+              echo "   版本标签：${{ env.IMAGE_TAG_VERSION }}"
+            else
+              echo "   默认标签：${{ env.IMAGE_TAG_LATEST }}"
+            fi
           else
             echo "⚠️ Docker镜像已在本地构建为'${{ env.IMAGE_TAG_LOCAL }}'，但未推送（缺少DockerHub token）"
             echo "要启用推送到DockerHub，请在仓库设置中配置DOCKERHUB_TOKEN密钥"
