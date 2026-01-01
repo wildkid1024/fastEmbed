@@ -1,7 +1,7 @@
 services:
   fastembed-svc:
-    # 使用 build 指令通过 Dockerfile 构建镜像
-    image: fastembed-server:v1.0.0-cuda
+    # 使用环境变量引用GitHub tag版本
+    image: wildkid1024/fastembed-server:${GITHUB_TAG:-v0.1.0}
     build: .
     container_name: fastembed-server
     # 使用宿主机网络
@@ -15,7 +15,7 @@ services:
     tty: true
     stdin_open: true
     # command: bash
-    command: ./build/embedding_server --model_path /Models/models-hf/sentence_models/bge-large-zh-v1.5/ --serve_model_name bge-large-zh-v1.5 --port 5000 
+    command: ./build/server --model_path /Models/models-hf/sentence_models/bge-large-zh-v1.5/ --serve_model_name bge-large-zh-v1.5 --port 5000 
     # 设置 runtime 为 nvidia
     runtime: nvidia
     deploy:

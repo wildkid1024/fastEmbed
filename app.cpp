@@ -5,7 +5,8 @@
 
 int main() {
     try {
-        std::string model_path = "/home/wildkid1024/Public/Models/bge-large-zh-v1.5";
+        std::string model_path = "/Models/models-hf/sentence_models/bge-large-zh-v1.5";
+        // std::string model_path = "/Models/BAAI/bge-m3";
 
         // 假设 SentenceTransformer 构造函数支持传入分词器路径
         SentenceTransformer model(model_path);
