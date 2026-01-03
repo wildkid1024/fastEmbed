@@ -20,6 +20,11 @@ public:
                                   const std::vector<float>& beta, 
                                   size_t embedding_dim, 
                                   float epsilon = 1e-5);
+    // RMS归一化方法
+    std::vector<float> rms_norm(const std::vector<float>& input, 
+                                const std::vector<float>& weight, 
+                                size_t embedding_dim, 
+                                float epsilon = 1e-5);
     // Softmax 方法声明 - 添加维度参数
     std::vector<float> softmax(const std::vector<float>& input, size_t axis = 1, size_t dim_size = 0);
 };

@@ -342,7 +342,7 @@ std::vector<float> CUDAMatrixOps::layer_norm(
     cudaMemcpy(d_gamma, gamma_ptr, gamma.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_beta, beta_ptr, beta.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 blockDim(1024);  // 每个block处理一个序列的所有特征
+    dim3 blockDim(1024);  // 每个block处理一个序列的所有特征， TODO: 当seq_len大于1024时，需要修改blockDim
     dim3 gridDim(seq_len);  // 每个序列分配一个block
 
     // 修改核函数调用参数
@@ -419,4 +419,102 @@ void CUDAMatrixOps::apply_softmax(float* input, size_t num_heads, size_t seq_len
     dim3 grid(1, (seq_len + block.y - 1) / block.y, num_heads);
     softmax_kernel_inplace<<<grid, block>>>(input, seq_len);
     cudaDeviceSynchronize();
+}
+
+// CUDA RMSNorm核函数
+__global__ void rms_norm_kernel(
+    const float* input, 
+    const float* weight, 
+    float* output, 
+    size_t seq_len, 
+    size_t embedding_dim, 
+    float epsilon) {
+    int seq_idx = blockIdx.x;  // block索引对应序列索引
+    int feature_idx = threadIdx.x;  // thread索引对应特征维度索引
+
+    if (seq_idx < seq_len && feature_idx < embedding_dim) {
+        // 计算当前token的RMSNorm归一化因子
+        extern __shared__ float s_square_sums[];  // 共享内存存储平方和
+        float val = input[seq_idx * embedding_dim + feature_idx];
+        float square_val = val * val;
+        
+        // 使用共享内存进行归约计算RMS
+        s_square_sums[feature_idx] = square_val;
+        __syncthreads();
+
+        // 简化实现：每个线程块的第一个线程计算整个token的RMS
+        if (feature_idx == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < embedding_dim; ++i) {
+                sum += s_square_sums[i];
+            }
+            sum /= embedding_dim;
+            sum += epsilon;
+            s_square_sums[0] = 1.0f / sqrtf(sum);  // 存储归一化因子
+        }
+        __syncthreads();
+
+        // 应用RMSNorm: (input * weight) / RMS
+        float norm_factor = s_square_sums[0];
+        output[seq_idx * embedding_dim + feature_idx] = 
+            norm_factor * weight[feature_idx] * val;
+    }
+}
+
+std::vector<float> CUDAMatrixOps::rms_norm(
+    const std::vector<float>& input, 
+    const std::vector<float>& weight, 
+    size_t embedding_dim, 
+    float epsilon) {
+    // 添加输入验证
+    if (input.empty() || weight.empty()) {
+        throw std::invalid_argument("Input vectors cannot be empty");
+    }
+    if (weight.size() != embedding_dim) {
+        throw std::invalid_argument("Weight must match embedding dimension size");
+    }
+
+    // 计算序列长度
+    size_t seq_len = input.size() / embedding_dim;
+    if (seq_len * embedding_dim != input.size()) {
+        throw std::invalid_argument("Input size is not divisible by embedding_dim");
+    }
+
+    std::vector<float> output(input.size());
+
+    // 分配GPU内存
+    float* d_input = nullptr;
+    float* d_weight = nullptr;
+    float* d_output = nullptr;
+
+    CHECK_CUDA_ERROR(cudaMalloc(&d_input, input.size() * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_weight, weight.size() * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_output, output.size() * sizeof(float)));
+
+    // 复制数据到GPU
+    CHECK_CUDA_ERROR(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_weight, weight.data(), weight.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // 配置CUDA执行参数
+    dim3 blockSize(embedding_dim);
+    dim3 gridSize(seq_len);
+    size_t sharedMemSize = embedding_dim * sizeof(float);
+
+    // 调用RMSNorm核函数
+    rms_norm_kernel<<<gridSize, blockSize, sharedMemSize>>>(
+        d_input, d_weight, d_output, seq_len, embedding_dim, epsilon);
+
+    // 检查核函数执行错误
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    // 将结果复制回主机
+    CHECK_CUDA_ERROR(cudaMemcpy(output.data(), d_output, output.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // 释放GPU内存
+    CHECK_CUDA_ERROR(cudaFree(d_input));
+    CHECK_CUDA_ERROR(cudaFree(d_weight));
+    CHECK_CUDA_ERROR(cudaFree(d_output));
+
+    return output;
 }

@@ -91,6 +91,35 @@ std::vector<float> CPUMatrixOps::layer_norm(const std::vector<float>& input,
     return output;
 }
 
+// RMS归一化实现
+std::vector<float> CPUMatrixOps::rms_norm(const std::vector<float>& input, 
+                                          const std::vector<float>& weight, 
+                                          size_t embedding_dim, 
+                                          float epsilon) {
+    std::vector<float> output = input;
+    size_t num_tokens = input.size() / embedding_dim;
+    
+    for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+        float norm_factor = 0.0f;
+        size_t start = token_idx * embedding_dim;
+        
+        // 计算RMS (Root Mean Square)
+        for (size_t i = 0; i < embedding_dim; ++i) {
+            float val = input[start + i];
+            norm_factor += val * val;
+        }
+        norm_factor /= embedding_dim;
+        norm_factor += epsilon;
+        norm_factor = 1.0f / std::sqrt(norm_factor);
+        
+        // 应用RMSNorm
+        for (size_t i = 0; i < embedding_dim; ++i) {
+            output[start + i] = norm_factor * weight[i] * input[start + i];
+        }
+    }
+    return output;
+}
+
 // Softmax 实现
 std::vector<float> CPUMatrixOps::softmax(const std::vector<float>& input, size_t axis, size_t dim_size) {
     if (axis == 0) {
