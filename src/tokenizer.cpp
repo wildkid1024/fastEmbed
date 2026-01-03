@@ -321,3 +321,133 @@ std::string XLMRobertaTokenizer::decode(const std::vector<int>& token_ids) {
     
     return text;
 }
+
+// Qwen3Tokenizer implementation - Hugging Face format constructor
+Qwen3Tokenizer::Qwen3Tokenizer(const std::string& tokenizer_json_path, const std::string& vocab_json_path) {
+    // 从vocab.json加载词汇表
+    std::ifstream vocab_file(vocab_json_path);
+    if (!vocab_file.is_open()) {
+        throw std::runtime_error("无法打开vocab.json文件: " + vocab_json_path);
+    }
+    
+    nlohmann::json vocab_json;
+    vocab_file >> vocab_json;
+    
+    if (vocab_json.is_object()) {
+        // vocab.json通常是对象格式: {"token": id, ...}
+        for (auto& [token, value] : vocab_json.items()) {
+            int id = value.get<int>();
+            vocab[token] = id;
+            id_to_token[id] = token;
+        }
+    } else {
+        throw std::runtime_error("vocab.json格式错误，应为对象格式");
+    }
+    
+    // 从tokenizer.json加载特殊token信息
+    std::ifstream tokenizer_file(tokenizer_json_path);
+    if (!tokenizer_file.is_open()) {
+        throw std::runtime_error("无法打开tokenizer.json文件: " + tokenizer_json_path);
+    }
+    
+    nlohmann::json tokenizer_config;
+    tokenizer_file >> tokenizer_config;
+    
+    // 设置特殊token ID
+    if (tokenizer_config.contains("bos_token")) {
+        std::string bos_token = tokenizer_config["bos_token"];
+        auto it = vocab.find(bos_token);
+        bos_token_id = (it != vocab.end()) ? it->second : 1; // 默认值
+    } else {
+        bos_token_id = 1; // 默认值
+    }
+    
+    if (tokenizer_config.contains("eos_token")) {
+        std::string eos_token = tokenizer_config["eos_token"];
+        auto it = vocab.find(eos_token);
+        eos_token_id = (it != vocab.end()) ? it->second : 2; // 默认值
+    } else {
+        eos_token_id = 2; // 默认值
+    }
+    
+    if (tokenizer_config.contains("unk_token")) {
+        std::string unk_token = tokenizer_config["unk_token"];
+        auto it = vocab.find(unk_token);
+        unk_token_id = (it != vocab.end()) ? it->second : 3; // 默认值
+    } else {
+        unk_token_id = 3; // 默认值
+    }
+    
+    if (tokenizer_config.contains("pad_token")) {
+        std::string pad_token = tokenizer_config["pad_token"];
+        auto it = vocab.find(pad_token);
+        pad_token_id = (it != vocab.end()) ? it->second : unk_token_id; // 默认使用unk_token_id
+    } else {
+        pad_token_id = unk_token_id; // 默认使用unk_token_id作为pad_token_id
+    }
+    
+    // 从tokenizer_config中获取Qwen3特有的特殊token
+    if (tokenizer_config.contains("added_tokens")) {
+        const auto& added_tokens = tokenizer_config["added_tokens"];
+        for (const auto& token_info : added_tokens) {
+            if (token_info.contains("content")) {
+                std::string content = token_info["content"];
+                int token_id = token_info["id"];
+                
+                if (content == "") {
+                    chat_start_token_id = token_id;
+                } else if (content == "```") {
+                    im_start_token_id = token_id;
+                } else if (content == "```") {
+                    im_end_token_id = token_id;
+                }
+            }
+        }
+    } else {
+        // 设置默认值
+        chat_start_token_id = -1;
+        im_start_token_id = 151644;  // Qwen3默认值
+        im_end_token_id = 151645;    // Qwen3默认值
+    }
+}
+
+std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
+    // 实现Hugging Face风格的分词逻辑
+    // 对于Qwen3，这可能涉及BPE分词
+    // 这里使用一个简化的分词实现，实际应用中可能需要更复杂的逻辑
+    std::vector<std::string> tokens;
+    
+    // 简单的字符级分词作为备选方案
+    // 在实际应用中，应该实现完整的BPE分词算法
+    for (char c : text) {
+        std::string token(1, c);
+        tokens.push_back(token);
+    }
+    
+    return tokens;
+}
+
+std::vector<int> Qwen3Tokenizer::encode(const std::vector<std::string>& tokens) {
+    std::vector<int> token_ids;
+    for (const auto& token : tokens) {
+        auto it = vocab.find(token);
+        if (it != vocab.end()) {
+            token_ids.push_back(it->second);
+        } else {
+            token_ids.push_back(unk_token_id);
+        }
+    }
+    return token_ids;
+}
+
+std::string Qwen3Tokenizer::decode(const std::vector<int>& token_ids) {
+    // 使用词汇表解码
+    std::string decoded_text;
+    for (int id : token_ids) {
+        auto it = id_to_token.find(id);
+        if (it != id_to_token.end()) {
+            decoded_text += it->second;
+        }
+    }
+    return decoded_text;
+}
