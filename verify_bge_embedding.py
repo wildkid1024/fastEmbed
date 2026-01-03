@@ -75,7 +75,8 @@ def main():
 def test_sentence_transformers():
     from sentence_transformers.models.Pooling import Pooling
     from sentence_transformers.models.Normalize import Normalize
-    model_path = "/home/wildkid1024/Models/BAAI/bge-m3/"
+    # model_path = "/home/wildkid1024/Models/BAAI/bge-m3/"
+    model_path = "/home/wildkid1024/Models/models-hf/sentence_models/bge-large-zh-v1.5"
     model = SentenceTransformer(model_path)
     print(model)
     texts = ["This is a test sentence.","Another example sentence."]  # 使用中文确保分词一致

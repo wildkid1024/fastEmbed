@@ -225,7 +225,7 @@ if (ENABLE_SERVER)
 add_subdirectory(${CROW_DIR})
 
 # 添加嵌入服务可执行文件
-add_executable(server embedding_server.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+add_executable(server http_server.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 
 target_link_libraries(server
     PRIVATE
