@@ -589,6 +589,9 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             printf("]\n");
         }
         
+        // 用于保存注意力残差后的值，供MLP残差使用
+        std::vector<float> hidden_after_attn;
+        
         // 2. 自注意力机制
         std::string q_proj_key = layer_prefix + "self_attn.q_proj.weight";
         std::string k_proj_key = layer_prefix + "self_attn.k_proj.weight";
@@ -868,9 +871,20 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                     printf("]\n");
                 }
                 
-                // 将注意力输出加到原始嵌入上
+                // 将注意力输出加到残差输入上（不是LN后的值）
                 for (size_t i = 0; i < embedded.size(); ++i) {
-                    embedded[i] += projected_output[i];
+                    embedded[i] = residual[i] + projected_output[i];
+                }
+                
+                // 保存注意力残差后的值，用于MLP残差连接
+                hidden_after_attn = embedded;
+                
+                // 调试输出：残差连接后的值
+                if (layer == 0) {
+                    size_t last_embedded = (seq_len - 1) * hidden_size;
+                    printf("DEBUG Layer 0 After residual[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+                    printf("]\n");
                 }
             }
         }
@@ -882,9 +896,17 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             float eps = this->config.value("rms_norm_eps", 1e-6f);
             
             embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+            
+            // 调试输出：post-attention LN后的值
+            if (layer == 0) {
+                size_t last_embedded = (seq_len - 1) * hidden_size;
+                printf("DEBUG Layer 0 After post-attn LN[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+                printf("]\n");
+            }
         }
         
-        // 4. MLP层
+        // 4. MLP层（在post-attention LN之后）
         std::string gate_proj_key = layer_prefix + "mlp.gate_proj.weight";
         std::string up_proj_key = layer_prefix + "mlp.up_proj.weight";
         std::string down_proj_key = layer_prefix + "mlp.down_proj.weight";
@@ -911,9 +933,29 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
             );
             
+            // 调试输出：Gate和Up投影后的值
+            if (layer == 0) {
+                size_t last_gate = (seq_len - 1) * intermediate_size;
+                printf("DEBUG Layer 0 Gate output[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_gate + j], j < 4 ? ", " : "");
+                printf("]\n");
+                
+                printf("DEBUG Layer 0 Up output[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", up_output[last_gate + j], j < 4 ? ", " : "");
+                printf("]\n");
+            }
+            
             // 应用SiLU激活函数: x * sigmoid(x)
             for (size_t i = 0; i < gate_output.size(); ++i) {
                 gate_output[i] = gate_output[i] * (1.0f / (1.0f + std::exp(-gate_output[i])));
+            }
+            
+            // 调试输出：SiLU激活后的值
+            if (layer == 0) {
+                size_t last_gate = (seq_len - 1) * intermediate_size;
+                printf("DEBUG Layer 0 Gate after SiLU[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_gate + j], j < 4 ? ", " : "");
+                printf("]\n");
             }
             
             // 逐元素相乘
@@ -921,20 +963,59 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 gate_output[i] *= up_output[i];
             }
             
+            // 调试输出：gate*up后的值
+            if (layer == 0) {
+                size_t last_intermediate = (seq_len - 1) * intermediate_size;
+                printf("DEBUG Layer 0 After gate*up[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_intermediate + j], j < 4 ? ", " : "");
+                printf("]\n");
+            }
+            
             // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
             std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
                 gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
             );
             
-            // 将MLP输出加到嵌入上
+            // 调试输出：down_proj权重形状和前几个值
+            if (layer == 0) {
+                printf("DEBUG Layer 0 down_proj_weight.size()=%zu (expected %zu)\n", 
+                       down_proj_weight.size(), intermediate_size * hidden_size);
+                printf("DEBUG Layer 0 down_proj_weight[:5] = [");
+                for (size_t i = 0; i < 5 && i < down_proj_weight.size(); ++i) {
+                    printf("%.6f%s", down_proj_weight[i], i < 4 ? ", " : "");
+                }
+                printf("]\n");
+            }
+            
+            // 调试输出：MLP输出
+            if (layer == 0) {
+                size_t last_mlp = (seq_len - 1) * hidden_size;
+                printf("DEBUG Layer 0 MLP output[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", mlp_output[last_mlp + j], j < 4 ? ", " : "");
+                printf("]\n");
+            }
+            
+            // 将MLP输出加到注意力残差后的值上（不是LN后的值）
             for (size_t i = 0; i < embedded.size(); ++i) {
-                embedded[i] += mlp_output[i];
+                embedded[i] = hidden_after_attn[i] + mlp_output[i];
+            }
+            
+            // 调试输出：MLP残差连接后
+            if (layer == 0) {
+                size_t last_embedded = (seq_len - 1) * hidden_size;
+                printf("DEBUG Layer 0 After MLP residual[last][:5] = [");
+                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+                printf("]\n");
             }
         }
         
-        // 残差连接：将原始输入加到处理后的嵌入上
-        for (size_t i = 0; i < embedded.size(); ++i) {
-            embedded[i] += residual[i];
+        // 调试输出：每层结束后的值（作为下一层的输入）
+        if (layer == 0 || layer == 1) {
+            size_t last_embedded = (seq_len - 1) * hidden_size;
+            printf("DEBUG Layer %zu output (Layer %zu input)[last][:5] = [",
+                   layer, layer + 1);
+            for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+            printf("]\n");
         }
     }
     
