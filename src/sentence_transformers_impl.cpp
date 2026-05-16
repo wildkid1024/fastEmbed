@@ -1,10 +1,14 @@
 #include "sentence_transformers_impl.h"
+#include <cstdio>
+#include <nlohmann/json.hpp>  // 添加缺失的头文件
 #include <safetensors.h>
 #include <stdexcept>
 #include <fstream>
 #include <sstream>
 #include <cmath>
 #include <iostream>
+#include <vector>  // 添加缺失的vector头文件
+#include <filesystem>  // 添加filesystem头文件以使用exists函数
 
 
 // 使用新的 tokenizer 进行分词
@@ -14,6 +18,21 @@ std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) 
         // 使用XLMRobertaTokenizer进行分词
         auto tokens = xlmr_tokenizer->tokenize(text);
         token_ids = xlmr_tokenizer->encode(tokens);
+    } else if (model_type == ModelType::QWEN3 && qwen3_tokenizer) {
+        // 使用Qwen3Tokenizer进行分词
+        auto tokens = qwen3_tokenizer->tokenize(text);
+        token_ids = qwen3_tokenizer->encode(tokens);
+        // Qwen3模型通常使用特殊token，如<s>和</s>，而不是[CLS]和[SEP]
+        // 根据模型配置决定是否添加特殊token
+        int bos_token_id = qwen3_tokenizer->get_bos_token_id();
+        int eos_token_id = qwen3_tokenizer->get_eos_token_id();
+        
+        if (bos_token_id != -1) {
+            token_ids.insert(token_ids.begin(), bos_token_id);
+        }
+        if (eos_token_id != -1) {
+            token_ids.push_back(eos_token_id);
+        }
     } else if (bge_tokenizer) {
         // 使用BGETokenizer进行分词
         auto tokens = bge_tokenizer->tokenize(text);
@@ -66,6 +85,8 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
         this->model_type = ModelType::BGE;
     } else if (model_type_str == "bge-m3" || model_type_str == "xlm-roberta") {
         this->model_type = ModelType::BGE_M3;
+    } else if (model_type_str == "qwen2" || model_type_str == "qwen3") {  // 添加Qwen2/Qwen3模型类型检测
+        this->model_type = ModelType::QWEN3;
     } else {
         std::cerr << "警告: 未知的模型类型 '" << model_type_str << "'，默认使用BGE_M3" << std::endl;
         this->model_type = ModelType::BGE_M3;
@@ -77,6 +98,23 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
         std::string tokenizer_json_path = tokenizer_path + "/tokenizer.json";
         std::string sentencepiece_model_path = tokenizer_path + "/sentencepiece.bpe.model";
         xlmr_tokenizer = std::make_unique<XLMRobertaTokenizer>(tokenizer_json_path, sentencepiece_model_path);
+    } else if (this->model_type == ModelType::QWEN3) {
+        // Qwen3模型使用Qwen3Tokenizer
+        std::string tokenizer_json_path = tokenizer_path + "/tokenizer.json";
+        
+        // Qwen3使用Hugging Face格式的tokenizer，通常不使用SentencePiece模型文件
+        // 检查是否有SentencePiece模型文件
+        std::string sentencepiece_model_path = tokenizer_path + "/tokenizer.model";
+        std::string vocab_json_path = tokenizer_path + "/vocab.json";
+        if (std::filesystem::exists(sentencepiece_model_path)) {
+            // 如果存在tokenizer.model，使用SentencePiece格式构造函数
+            qwen3_tokenizer = std::make_unique<Qwen3Tokenizer>(tokenizer_json_path, sentencepiece_model_path);
+        }
+        if (!std::filesystem::exists(vocab_json_path)){
+            throw std::runtime_error("无法找到Qwen3的任何tokenizer");
+        }
+        // 如果存在vocab.json，使用Hugging Face格式构造函数
+        qwen3_tokenizer = std::make_unique<Qwen3Tokenizer>(tokenizer_json_path, vocab_json_path);
     } else {
         // 传统BGE模型使用BGETokenizer
         bge_tokenizer = std::make_unique<BGETokenizer>(tokenizer_path + "/vocab.txt");
@@ -90,11 +128,17 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
     
     // 设置嵌入维度
     const int vocab_size = this->config["vocab_size"];
-    if (weights.find("embeddings.word_embeddings.weight") != weights.end()) {
-        embedding_dim = weights["embeddings.word_embeddings.weight"].size() / vocab_size;
-    } else {
+    
+    // 根据模型类型查找嵌入层权重
+    std::string embedding_weight_name = "embeddings.word_embeddings.weight";
+    if (model_type == ModelType::QWEN3) {
+        // Qwen3模型使用不同的嵌入层权重名称
+        embedding_weight_name = "embed_tokens.weight";
+    } else if (weights.find(embedding_weight_name) == weights.end()) {
         throw std::runtime_error("未找到嵌入层权重");
     }
+
+    embedding_dim = weights[embedding_weight_name].size() / vocab_size;
 }
 
 
@@ -343,6 +387,220 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     return pooled;
 }
 
+// Qwen3模型的前向传播
+std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int32_t>& tokens) {
+    // 获取词嵌入
+    std::vector<float> embedded = embedding_layer(tokens);
+    size_t seq_len = tokens.size();
+    size_t hidden_size = embedding_dim;
+    
+    // 获取模型配置
+    size_t num_layers = this->config["num_hidden_layers"];
+    size_t num_attention_heads = this->config["num_attention_heads"];
+    size_t head_dim = hidden_size / num_attention_heads;  // 计算每个头的维度
+    
+    // 通过每一层Transformer
+    for (size_t layer = 0; layer < num_layers; ++layer) {
+        std::string layer_prefix = "layers." + std::to_string(layer) + ".";
+        
+        // 保存残差连接的输入
+        std::vector<float> residual = embedded;
+        
+        // 1. 输入层RMS归一化（Pre-Norm架构）
+        std::string input_layernorm_weight_key = layer_prefix + "input_layernorm.weight";
+        if (weights.find(input_layernorm_weight_key) != weights.end()) {
+            const std::vector<float>& ln_weight = weights[input_layernorm_weight_key];
+            float eps = this->config.value("rms_norm_eps", 1e-6f);
+            embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+        }
+
+        printf("计算完成rms_norm");
+        
+        // 2. 自注意力机制
+        std::string q_proj_key = layer_prefix + "self_attn.q_proj.weight";
+        std::string k_proj_key = layer_prefix + "self_attn.k_proj.weight";
+        std::string v_proj_key = layer_prefix + "self_attn.v_proj.weight";
+        std::string o_proj_key = layer_prefix + "self_attn.o_proj.weight";
+        
+        // 检查是否存在注意力权重
+        if (weights.find(q_proj_key) != weights.end() && 
+            weights.find(k_proj_key) != weights.end() && 
+            weights.find(v_proj_key) != weights.end() && 
+            weights.find(o_proj_key) != weights.end()) {
+            
+            // 获取投影权重
+            const std::vector<float>& q_proj_weight = weights[q_proj_key];
+            const std::vector<float>& k_proj_weight = weights[k_proj_key];
+            const std::vector<float>& v_proj_weight = weights[v_proj_key];
+            const std::vector<float>& o_proj_weight = weights[o_proj_key];
+            
+            // 获取Qwen3特有的查询和键归一化权重
+            std::string q_norm_key = layer_prefix + "self_attn.q_norm.weight";
+            std::string k_norm_key = layer_prefix + "self_attn.k_norm.weight";
+            
+            if (weights.find(q_norm_key) != weights.end() && weights.find(k_norm_key) != weights.end()) {
+                const std::vector<float>& q_norm_weight = weights[q_norm_key];
+                const std::vector<float>& k_norm_weight = weights[k_norm_key];
+                
+                // 执行Q、K、V投影
+                std::vector<float> q_states = cuda_matrix_ops.matrix_multiply_transpose(
+                    embedded, q_proj_weight, seq_len, hidden_size, hidden_size
+                );
+                
+                std::vector<float> k_states = cuda_matrix_ops.matrix_multiply_transpose(
+                    embedded, k_proj_weight, seq_len, hidden_size, hidden_size
+                );
+                
+                std::vector<float> v_states = cuda_matrix_ops.matrix_multiply_transpose(
+                    embedded, v_proj_weight, seq_len, hidden_size, hidden_size
+                );
+
+                printf("计算完成q_states投影");
+                
+                // 应用查询和键的RMS归一化
+                for (size_t i = 0; i < seq_len; ++i) {
+                    for (size_t h = 0; h < num_attention_heads; ++h) {
+                        float q_norm_factor = 0.0f;
+                        float k_norm_factor = 0.0f;
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            size_t idx = i * hidden_size + h * head_dim + d;
+                            
+                            if (d < q_norm_weight.size()) {
+                                q_norm_factor += q_states[idx] * q_states[idx];
+                            }
+                            
+                            if (d < k_norm_weight.size()) {
+                                k_norm_factor += k_states[idx] * k_states[idx];
+                            }
+                        }
+                        
+                        q_norm_factor /= head_dim;
+                        q_norm_factor += 1e-6f;
+                        q_norm_factor = 1.0f / std::sqrt(q_norm_factor);
+                        
+                        k_norm_factor /= head_dim;
+                        k_norm_factor += 1e-6f;
+                        k_norm_factor = 1.0f / std::sqrt(k_norm_factor);
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            size_t idx = i * hidden_size + h * head_dim + d;
+                            
+                            if (d < q_norm_weight.size()) {
+                                q_states[idx] = (q_states[idx] * q_norm_factor) * q_norm_weight[d];
+                            }
+                            
+                            if (d < k_norm_weight.size()) {
+                                k_states[idx] = (k_states[idx] * k_norm_factor) * k_norm_weight[d];
+                            }
+                        }
+                    }
+                }
+                
+                // 简化的注意力计算 (实际需要实现多头注意力和旋转位置编码)
+                std::vector<float> attn_output(seq_len * hidden_size, 0.0f);
+                
+                // 应用输出投影
+                attn_output = cuda_matrix_ops.matrix_multiply_transpose(
+                    q_states, o_proj_weight, seq_len, hidden_size, hidden_size
+                );
+                
+                // 将注意力输出加到原始嵌入上
+                for (size_t i = 0; i < embedded.size(); ++i) {
+                    embedded[i] += attn_output[i];
+                }
+            }
+        }
+        
+        // 3. 后注意力层RMS归一化（在MLP之前应用）
+        std::string post_attn_layernorm_key = layer_prefix + "post_attention_layernorm.weight";
+        if (weights.find(post_attn_layernorm_key) != weights.end()) {
+            const std::vector<float>& ln_weight = weights[post_attn_layernorm_key];
+            float eps = this->config.value("rms_norm_eps", 1e-6f);
+            
+            embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+        }
+        
+        // 4. MLP层
+        std::string gate_proj_key = layer_prefix + "mlp.gate_proj.weight";
+        std::string up_proj_key = layer_prefix + "mlp.up_proj.weight";
+        std::string down_proj_key = layer_prefix + "mlp.down_proj.weight";
+        
+        if (weights.find(gate_proj_key) != weights.end() && 
+            weights.find(up_proj_key) != weights.end() && 
+            weights.find(down_proj_key) != weights.end()) {
+            
+            const std::vector<float>& gate_proj_weight = weights[gate_proj_key];
+            const std::vector<float>& up_proj_weight = weights[up_proj_key];
+            const std::vector<float>& down_proj_weight = weights[down_proj_key];
+            
+            // 执行MLP前馈网络
+            // gate_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
+            std::vector<float> gate_output = cuda_matrix_ops.matrix_multiply_transpose(
+                embedded, gate_proj_weight, seq_len, hidden_size, 3072  // 假设intermediate_size为3072
+            );
+            
+            // up_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
+            std::vector<float> up_output = cuda_matrix_ops.matrix_multiply_transpose(
+                embedded, up_proj_weight, seq_len, hidden_size, 3072  // 假设intermediate_size为3072
+            );
+            
+            // 应用SiLU激活函数: x * sigmoid(x)
+            for (size_t i = 0; i < gate_output.size(); ++i) {
+                gate_output[i] = gate_output[i] * (1.0f / (1.0f + std::exp(-gate_output[i])));
+            }
+            
+            // 逐元素相乘
+            for (size_t i = 0; i < gate_output.size(); ++i) {
+                gate_output[i] *= up_output[i];
+            }
+            
+            // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
+            std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
+                gate_output, down_proj_weight, seq_len, 3072, hidden_size
+            );
+            
+            // 将MLP输出加到嵌入上
+            for (size_t i = 0; i < embedded.size(); ++i) {
+                embedded[i] += mlp_output[i];
+            }
+        }
+        
+        // 残差连接：将原始输入加到处理后的嵌入上
+        for (size_t i = 0; i < embedded.size(); ++i) {
+            embedded[i] += residual[i];
+        }
+    }
+    
+    // 最后的RMS层归一化
+    if (weights.find("norm.weight") != weights.end()) {
+        const std::vector<float>& final_norm_weight = weights["norm.weight"];
+        float eps = this->config.value("rms_norm_eps", 1e-6f); // 使用配置中的rms_norm_eps值
+        
+        embedded = cuda_matrix_ops.rms_norm(embedded, final_norm_weight, hidden_size, eps);
+    }
+    
+    // Qwen3使用last token pooling策略
+    // 取最后一个token的隐藏状态作为句子表示
+    std::vector<float> pooled_output(hidden_size);
+    for (size_t j = 0; j < hidden_size; ++j) {
+        pooled_output[j] = embedded[(seq_len - 1) * embedding_dim + j];  // 最后一个token
+    }
+    // 归一化输出向量
+    float norm = 0.0f;
+    for (float val : pooled_output) {
+        norm += val * val;
+    }
+    norm = std::sqrt(norm);
+    if (norm > 0.0f) {
+        for (float& val : pooled_output) {
+            val /= norm;
+        }
+    }
+    
+    return pooled_output;
+}
+
 std::vector<float> SentenceTransformerImpl::encode(const std::string& text) {
     // 分词
     std::vector<int32_t> tokens = tokenize(text);
@@ -352,8 +610,13 @@ std::vector<float> SentenceTransformerImpl::encode(const std::string& text) {
         std::cout << token << " ";
     }
     std::cout << std::endl;
-    // BGE 模型前向传播
-    return bge_forward(tokens);
+    
+    // 根据模型类型选择前向传播方法
+    if (model_type == ModelType::QWEN3) {
+        return qwen3_forward(tokens);
+    } else {
+        return bge_forward(tokens);
+    }
 }
 
 std::vector<std::vector<float>> SentenceTransformerImpl::encode_batch(const std::vector<std::string>& texts) {

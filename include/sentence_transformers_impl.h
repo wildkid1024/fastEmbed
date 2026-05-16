@@ -19,15 +19,17 @@ using json = nlohmann::json;
 // 模型类型枚举
 enum class ModelType {
     BGE,
-    BGE_M3
+    BGE_M3,
+    QWEN3  // 添加Qwen3模型类型
 };
 
 class SentenceTransformerImpl {
 private:
-    // 支持两种分词器
+    // 支持三种分词器
     ModelType model_type;
     std::unique_ptr<BGETokenizer> bge_tokenizer;
     std::unique_ptr<XLMRobertaTokenizer> xlmr_tokenizer;
+    std::unique_ptr<Qwen3Tokenizer> qwen3_tokenizer; 
     
     std::unordered_map<std::string, int64_t> vocab;
     std::unordered_map<std::string, std::vector<float>> weights;
@@ -68,11 +70,12 @@ private:
                                                                   size_t intermediate_dim,
                                                                   float dropout_prob = 0.1f);
     std::vector<float> bge_forward(const std::vector<int32_t>& tokens);
+    std::vector<float> qwen3_forward(const std::vector<int32_t>& tokens);  // 添加Qwen3前向传播函数
 
 public:
-    // 支持两种构造函数，一种用于传统BGE模型，一种用于BGE-M3模型
+    // 支持三种构造函数，一种用于传统BGE模型，一种用于BGE-M3模型，一种用于Qwen3模型    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
     SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
-    std::vector<float> encode(const std::string& text);
+     std::vector<float> encode(const std::string& text);
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
     size_t get_embedding_dimension() const;
 };
