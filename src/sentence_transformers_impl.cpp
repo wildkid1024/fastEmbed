@@ -417,51 +417,73 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     return pooled;
 }
 
-// RoPE (Rotary Position Embedding) 实现
+// RoPE (Rotary Position Embedding) 实现 - 匹配transformers库的Qwen2/Qwen3实现
 static void apply_rope(std::vector<float>& q_states, std::vector<float>& k_states,
                        size_t seq_len, size_t q_dim, size_t num_q_heads,
                        size_t k_dim, size_t num_kv_heads,
                        float rope_theta = 1000000.0f) {
     size_t q_head_dim = q_dim / num_q_heads;
     size_t k_head_dim = k_dim / num_kv_heads;
+    size_t q_half_dim = q_head_dim / 2;
+    size_t k_half_dim = k_head_dim / 2;
     
     // 对每个位置应用RoPE
     for (size_t pos = 0; pos < seq_len; ++pos) {
         // 对Q应用RoPE
         for (size_t h = 0; h < num_q_heads; ++h) {
-            for (size_t d = 0; d < q_head_dim; d += 2) {
-                if (d + 1 >= q_head_dim) break;
+            // 计算该位置的cos/sin值（每个维度独立）
+            std::vector<float> cos_vals(q_head_dim);
+            std::vector<float> sin_vals(q_head_dim);
+            for (size_t d = 0; d < q_head_dim; ++d) {
+                // transformers库的公式：inv_freq[i] = 1.0 / (base^(2*i / head_dim))
+                // 然后cos[d] = cos(pos * inv_freq[d % half_dim])
+                size_t idx = d < q_half_dim ? d : d - q_half_dim;
+                float inv_freq = 1.0f / std::pow(rope_theta, 2.0f * static_cast<float>(idx) / static_cast<float>(q_head_dim));
+                float theta = static_cast<float>(pos) * inv_freq;
+                cos_vals[d] = std::cos(theta);
+                sin_vals[d] = std::sin(theta);
+            }
+            
+            // 应用RoPE：q' = q * cos + rotate_half(q) * sin
+            // rotate_half(q) = [-q[half:], q[:half]]
+            // 所以：q'[d] = q[d] * cos[d] - q[d + half] * sin[d]  (d < half)
+            //      q'[d + half] = q[d] * sin[d] + q[d + half] * cos[d]
+            for (size_t d = 0; d < q_half_dim; ++d) {
+                size_t base_idx = pos * q_dim + h * q_head_dim;
+                float q0 = q_states[base_idx + d];
+                float q1 = q_states[base_idx + d + q_half_dim];
+                float cos_d = cos_vals[d];
+                float sin_d = sin_vals[d];
                 
-                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(d) / static_cast<float>(q_head_dim));
-                float theta = pos * freq;
-                float cos_val = std::cos(theta);
-                float sin_val = std::sin(theta);
-                
-                size_t idx = pos * q_dim + h * q_head_dim + d;
-                float q0 = q_states[idx];
-                float q1 = q_states[idx + 1];
-                
-                q_states[idx] = q0 * cos_val - q1 * sin_val;
-                q_states[idx + 1] = q0 * sin_val + q1 * cos_val;
+                q_states[base_idx + d] = q0 * cos_d - q1 * sin_d;
+                q_states[base_idx + d + q_half_dim] = q0 * sin_d + q1 * cos_d;
             }
         }
         
         // 对K应用RoPE
         for (size_t h = 0; h < num_kv_heads; ++h) {
-            for (size_t d = 0; d < k_head_dim; d += 2) {
-                if (d + 1 >= k_head_dim) break;
+            // 计算该位置的cos/sin值
+            std::vector<float> cos_vals(k_head_dim);
+            std::vector<float> sin_vals(k_head_dim);
+            for (size_t d = 0; d < k_head_dim; ++d) {
+                // transformers库的公式：inv_freq[i] = 1.0 / (base^(2*i / head_dim))
+                size_t idx = d < k_half_dim ? d : d - k_half_dim;
+                float inv_freq = 1.0f / std::pow(rope_theta, 2.0f * static_cast<float>(idx) / static_cast<float>(k_head_dim));
+                float theta = static_cast<float>(pos) * inv_freq;
+                cos_vals[d] = std::cos(theta);
+                sin_vals[d] = std::sin(theta);
+            }
+            
+            // 应用RoPE
+            for (size_t d = 0; d < k_half_dim; ++d) {
+                size_t base_idx = pos * k_dim + h * k_head_dim;
+                float k0 = k_states[base_idx + d];
+                float k1 = k_states[base_idx + d + k_half_dim];
+                float cos_d = cos_vals[d];
+                float sin_d = sin_vals[d];
                 
-                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(d) / static_cast<float>(k_head_dim));
-                float theta = pos * freq;
-                float cos_val = std::cos(theta);
-                float sin_val = std::sin(theta);
-                
-                size_t idx = pos * k_dim + h * k_head_dim + d;
-                float k0 = k_states[idx];
-                float k1 = k_states[idx + 1];
-                
-                k_states[idx] = k0 * cos_val - k1 * sin_val;
-                k_states[idx + 1] = k0 * sin_val + k1 * cos_val;
+                k_states[base_idx + d] = k0 * cos_d - k1 * sin_d;
+                k_states[base_idx + d + k_half_dim] = k0 * sin_d + k1 * cos_d;
             }
         }
     }
@@ -711,6 +733,9 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                     printf("DEBUG Layer 0 after q_norm Q[head0][last][:5] = [");
                     for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
                     printf("]\n");
+                    printf("DEBUG Layer 0 after q_norm Q[head0][last][64:69] = [");
+                    for (size_t j = 64; j < 69; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 68 ? ", " : "");
+                    printf("]\n");
                     printf("DEBUG Layer 0 after k_norm K[head0][last][:5] = [");
                     for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
                     printf("]\n");
@@ -727,6 +752,9 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                     size_t last_k = (seq_len - 1) * num_key_value_heads * head_dim;
                     printf("DEBUG Layer 0 after RoPE Q[head0][last][:5] = [");
                     for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    printf("DEBUG Layer 0 after RoPE Q[head0][last][64:69] = [");
+                    for (size_t j = 64; j < 69; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 68 ? ", " : "");
                     printf("]\n");
                     printf("DEBUG Layer 0 after RoPE K[head0][last][:5] = [");
                     for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
@@ -826,6 +854,19 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 std::vector<float> projected_output = cuda_matrix_ops.matrix_multiply_transpose(
                     attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
                 );
+                
+                // 调试输出：打印Layer 0的attn_output和projected_output
+                if (layer == 0) {
+                    size_t last_attn = (seq_len - 1) * q_output_dim;
+                    printf("DEBUG Layer 0 attn_output[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", attn_output[last_attn + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    
+                    size_t last_proj = (seq_len - 1) * hidden_size;
+                    printf("DEBUG Layer 0 projected_output[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", projected_output[last_proj + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                }
                 
                 // 将注意力输出加到原始嵌入上
                 for (size_t i = 0; i < embedded.size(); ++i) {
