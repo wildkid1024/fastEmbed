@@ -47,12 +47,42 @@ std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) 
 
 // 简单的嵌入层前向传播
 std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<int32_t>& tokens) {
+    printf("DEBUG: embedding_layer called with %zu tokens\n", tokens.size());
     // 调整输出向量大小为 tokens.size() * embedding_dim
     std::vector<float> output(tokens.size() * embedding_dim, 0.0f);
-    const std::vector<float>& embedding_weight = weights["embeddings.word_embeddings.weight"];
+    
+    // 根据模型类型选择正确的词嵌入权重键名
+    std::string embed_weight_key;
+    if (model_type == ModelType::QWEN3) {
+        embed_weight_key = "embed_tokens.weight";
+    } else {
+        embed_weight_key = "embeddings.word_embeddings.weight";
+    }
+    
+    const std::vector<float>& embedding_weight = weights[embed_weight_key];
+    
+    // 调试输出：打印词嵌入权重的前几个值和token IDs
+    if (tokens.size() > 0) {
+        printf("DEBUG: embed_weight_key=%s, size=%zu\n", embed_weight_key.c_str(), embedding_weight.size());
+        printf("DEBUG: tokens[0]=%d, tokens[1]=%d\n", tokens[0], tokens.size() > 1 ? tokens[1] : -1);
+        
+        // 打印第一个token对应的权重前5个值
+        if (tokens[0] >= 0 && static_cast<size_t>(tokens[0]) < embedding_weight.size() / embedding_dim) {
+            size_t start_idx = tokens[0] * embedding_dim;
+            printf("DEBUG: embed_weight[token0][:5] = [");
+            for (size_t j = 0; j < 5; ++j) {
+                printf("%.6f%s", embedding_weight[start_idx + j], j < 4 ? ", " : "");
+            }
+            printf("]\n");
+        }
+    }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         int32_t token = tokens[i];
+        if (token < 0 || static_cast<size_t>(token) >= embedding_weight.size() / embedding_dim) {
+            // Token超出范围，跳过
+            continue;
+        }
         size_t start_idx = token * embedding_dim;
         // 复制当前 token 对应的嵌入向量到输出中
         for (size_t j = 0; j < embedding_dim; ++j) {
@@ -387,17 +417,96 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     return pooled;
 }
 
+// RoPE (Rotary Position Embedding) 实现
+static void apply_rope(std::vector<float>& q_states, std::vector<float>& k_states,
+                       size_t seq_len, size_t q_dim, size_t num_q_heads,
+                       size_t k_dim, size_t num_kv_heads,
+                       float rope_theta = 1000000.0f) {
+    size_t q_head_dim = q_dim / num_q_heads;
+    size_t k_head_dim = k_dim / num_kv_heads;
+    
+    // 对每个位置应用RoPE
+    for (size_t pos = 0; pos < seq_len; ++pos) {
+        // 对Q应用RoPE
+        for (size_t h = 0; h < num_q_heads; ++h) {
+            for (size_t d = 0; d < q_head_dim; d += 2) {
+                if (d + 1 >= q_head_dim) break;
+                
+                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(d) / static_cast<float>(q_head_dim));
+                float theta = pos * freq;
+                float cos_val = std::cos(theta);
+                float sin_val = std::sin(theta);
+                
+                size_t idx = pos * q_dim + h * q_head_dim + d;
+                float q0 = q_states[idx];
+                float q1 = q_states[idx + 1];
+                
+                q_states[idx] = q0 * cos_val - q1 * sin_val;
+                q_states[idx + 1] = q0 * sin_val + q1 * cos_val;
+            }
+        }
+        
+        // 对K应用RoPE
+        for (size_t h = 0; h < num_kv_heads; ++h) {
+            for (size_t d = 0; d < k_head_dim; d += 2) {
+                if (d + 1 >= k_head_dim) break;
+                
+                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(d) / static_cast<float>(k_head_dim));
+                float theta = pos * freq;
+                float cos_val = std::cos(theta);
+                float sin_val = std::sin(theta);
+                
+                size_t idx = pos * k_dim + h * k_head_dim + d;
+                float k0 = k_states[idx];
+                float k1 = k_states[idx + 1];
+                
+                k_states[idx] = k0 * cos_val - k1 * sin_val;
+                k_states[idx + 1] = k0 * sin_val + k1 * cos_val;
+            }
+        }
+    }
+}
+
 // Qwen3模型的前向传播
 std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int32_t>& tokens) {
+    printf("DEBUG: qwen3_forward start, seq_len=%zu\n", tokens.size());
     // 获取词嵌入
     std::vector<float> embedded = embedding_layer(tokens);
     size_t seq_len = tokens.size();
     size_t hidden_size = embedding_dim;
     
+    // 调试输出：打印embedding_layer的输出
+    if (seq_len > 0) {
+        size_t last_tok = (seq_len - 1) * hidden_size;
+        printf("DEBUG: after embedding_layer[last][:5] = [");
+        for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
+            printf("%.6f%s", embedded[last_tok + j], j < 4 ? ", " : "");
+        }
+        printf("]\n");
+    }
+    
+    printf("DEBUG: after embedding, hidden_size=%zu\n", hidden_size);
+    
     // 获取模型配置
     size_t num_layers = this->config["num_hidden_layers"];
     size_t num_attention_heads = this->config["num_attention_heads"];
-    size_t head_dim = hidden_size / num_attention_heads;  // 计算每个头的维度
+    size_t num_key_value_heads = this->config.contains("num_key_value_heads") ? 
+                                this->config["num_key_value_heads"].get<size_t>() : num_attention_heads;
+    
+    printf("DEBUG: num_layers=%zu, num_attn_heads=%zu, num_kv_heads=%zu\n", num_layers, num_attention_heads, num_key_value_heads);
+    
+    // Qwen3使用GQA，Q的维度可能不同于hidden_size
+    std::string q_proj_key_check = "layers.0.self_attn.q_proj.weight";
+    size_t q_output_dim = hidden_size;  // 默认值
+    if (weights.find(q_proj_key_check) != weights.end()) {
+        const auto& q_weight = weights[q_proj_key_check];
+        q_output_dim = q_weight.size() / hidden_size;  // [q_output_dim, hidden_size]
+        printf("DEBUG: q_weight.size()=%zu, q_output_dim=%zu\n", q_weight.size(), q_output_dim);
+    }
+    size_t head_dim = q_output_dim / num_attention_heads;
+    size_t kv_output_dim = num_key_value_heads * head_dim;
+    
+    printf("DEBUG: head_dim=%zu, kv_output_dim=%zu\n", head_dim, kv_output_dim);
     
     // 通过每一层Transformer
     for (size_t layer = 0; layer < num_layers; ++layer) {
@@ -411,10 +520,52 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
         if (weights.find(input_layernorm_weight_key) != weights.end()) {
             const std::vector<float>& ln_weight = weights[input_layernorm_weight_key];
             float eps = this->config.value("rms_norm_eps", 1e-6f);
+            
+            // 调试输出：Layer 0的LN权重和输入
+            if (layer == 0) {
+                size_t last_embedded_before = (seq_len - 1) * hidden_size;
+                printf("DEBUG Layer 0 before Input LN[last][:5] = [");
+                for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
+                    printf("%.6f%s", embedded[last_embedded_before + j], j < 4 ? ", " : "");
+                }
+                printf("]\n");
+                
+                // 计算embedded的统计信息（仅最后一个token）
+                float sum_sq = 0.0f;
+                float min_val = embedded[last_embedded_before], max_val = embedded[last_embedded_before];
+                for (size_t j = 0; j < hidden_size; ++j) {
+                    float val = embedded[last_embedded_before + j];
+                    sum_sq += val * val;
+                    if (val < min_val) min_val = val;
+                    if (val > max_val) max_val = val;
+                }
+                float rms = std::sqrt(sum_sq / hidden_size);
+                printf("DEBUG Layer 0 last token stats: RMS=%.6f, min=%.6f, max=%.6f\n", rms, min_val, max_val);
+                
+                printf("DEBUG Layer 0 found input_layernorm.weight, size=%zu\n", ln_weight.size());
+                printf("DEBUG Layer 0 input_layernorm.weight[:5] = [");
+                for (size_t j = 0; j < 5 && j < ln_weight.size(); ++j) {
+                    printf("%.6f%s", ln_weight[j], j < 4 ? ", " : "");
+                }
+                printf("]\n");
+            }
+            
             embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+        } else {
+            if (layer == 0) {
+                printf("DEBUG Layer 0 ERROR: input_layernorm.weight NOT FOUND! Key: %s\n", input_layernorm_weight_key.c_str());
+            }
         }
 
-        printf("计算完成rms_norm");
+        // 调试输出：Layer 0 input LN后的值
+        if (layer == 0) {
+            size_t last_embedded = (seq_len - 1) * hidden_size;
+            printf("DEBUG Layer 0 after Input LN[last][:5] = [");
+            for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
+                printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+            }
+            printf("]\n");
+        }
         
         // 2. 自注意力机制
         std::string q_proj_key = layer_prefix + "self_attn.q_proj.weight";
@@ -434,6 +585,17 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             const std::vector<float>& v_proj_weight = weights[v_proj_key];
             const std::vector<float>& o_proj_weight = weights[o_proj_key];
             
+            // 调试输出：打印权重形状和前几个值
+            if (layer == 0) {
+                printf("DEBUG Layer 0 q_proj_weight.size()=%zu (expected %zu)\n", q_proj_weight.size(), q_output_dim * hidden_size);
+                printf("DEBUG Layer 0 k_proj_weight.size()=%zu (expected %zu)\n", k_proj_weight.size(), kv_output_dim * hidden_size);
+                printf("DEBUG Layer 0 q_proj_weight[:5] = [");
+                for (size_t i = 0; i < 5 && i < q_proj_weight.size(); ++i) {
+                    printf("%.6f%s", q_proj_weight[i], i < 4 ? ", " : "");
+                }
+                printf("]\n");
+            }
+            
             // 获取Qwen3特有的查询和键归一化权重
             std::string q_norm_key = layer_prefix + "self_attn.q_norm.weight";
             std::string k_norm_key = layer_prefix + "self_attn.k_norm.weight";
@@ -442,72 +604,232 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 const std::vector<float>& q_norm_weight = weights[q_norm_key];
                 const std::vector<float>& k_norm_weight = weights[k_norm_key];
                 
-                // 执行Q、K、V投影
+                // 执行Q、K、V投影（使用正确的维度）
+                // Q: [seq_len, hidden_size] x [hidden_size, q_output_dim]
                 std::vector<float> q_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, q_proj_weight, seq_len, hidden_size, hidden_size
+                    embedded, q_proj_weight, seq_len, hidden_size, q_output_dim
                 );
                 
+                // K/V: [seq_len, hidden_size] x [hidden_size, kv_output_dim]
                 std::vector<float> k_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, k_proj_weight, seq_len, hidden_size, hidden_size
+                    embedded, k_proj_weight, seq_len, hidden_size, kv_output_dim
                 );
                 
                 std::vector<float> v_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, v_proj_weight, seq_len, hidden_size, hidden_size
+                    embedded, v_proj_weight, seq_len, hidden_size, kv_output_dim
                 );
-
-                printf("计算完成q_states投影");
                 
-                // 应用查询和键的RMS归一化
+                // 调试输出：打印embedded最后一个token的前5个值
+                if (layer == 0) {
+                    size_t last_embedded = (seq_len - 1) * hidden_size;
+                    printf("DEBUG Layer 0 embedded[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    
+                    printf("DEBUG Layer 0 Q[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_states[(seq_len - 1) * q_output_dim + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    printf("DEBUG Layer 0 K[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_states[(seq_len - 1) * kv_output_dim + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    printf("DEBUG Layer 0 V[last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", v_states[(seq_len - 1) * kv_output_dim + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                }
+                
+                // Reshape Q/K/V为多头格式: [seq_len, num_heads, head_dim]
+                // 存储为 [seq_len * num_heads * head_dim]
+                std::vector<float> q_reshaped(seq_len * num_attention_heads * head_dim);
+                std::vector<float> k_reshaped(seq_len * num_key_value_heads * head_dim);
+                std::vector<float> v_reshaped(seq_len * num_key_value_heads * head_dim);
+                
+                printf("DEBUG: q_output_dim=%zu, kv_output_dim=%zu, head_dim=%zu\n", q_output_dim, kv_output_dim, head_dim);
+                printf("DEBUG: q_reshaped size=%zu, expected=%zu\n", q_reshaped.size(), seq_len * num_attention_heads * head_dim);
+                
                 for (size_t i = 0; i < seq_len; ++i) {
                     for (size_t h = 0; h < num_attention_heads; ++h) {
-                        float q_norm_factor = 0.0f;
-                        float k_norm_factor = 0.0f;
-                        
                         for (size_t d = 0; d < head_dim; ++d) {
-                            size_t idx = i * hidden_size + h * head_dim + d;
-                            
-                            if (d < q_norm_weight.size()) {
-                                q_norm_factor += q_states[idx] * q_states[idx];
-                            }
-                            
-                            if (d < k_norm_weight.size()) {
-                                k_norm_factor += k_states[idx] * k_states[idx];
+                            size_t src_idx = i * q_output_dim + h * head_dim + d;
+                            size_t dst_idx = i * num_attention_heads * head_dim + h * head_dim + d;
+                            if (src_idx < q_states.size() && dst_idx < q_reshaped.size()) {
+                                q_reshaped[dst_idx] = q_states[src_idx];
                             }
                         }
-                        
-                        q_norm_factor /= head_dim;
-                        q_norm_factor += 1e-6f;
-                        q_norm_factor = 1.0f / std::sqrt(q_norm_factor);
-                        
-                        k_norm_factor /= head_dim;
-                        k_norm_factor += 1e-6f;
-                        k_norm_factor = 1.0f / std::sqrt(k_norm_factor);
-                        
+                    }
+                    for (size_t h = 0; h < num_key_value_heads; ++h) {
                         for (size_t d = 0; d < head_dim; ++d) {
-                            size_t idx = i * hidden_size + h * head_dim + d;
-                            
-                            if (d < q_norm_weight.size()) {
-                                q_states[idx] = (q_states[idx] * q_norm_factor) * q_norm_weight[d];
+                            size_t src_idx_k = i * kv_output_dim + h * head_dim + d;
+                            size_t dst_idx_k = i * num_key_value_heads * head_dim + h * head_dim + d;
+                            if (src_idx_k < k_states.size() && dst_idx_k < k_reshaped.size()) {
+                                k_reshaped[dst_idx_k] = k_states[src_idx_k];
                             }
                             
-                            if (d < k_norm_weight.size()) {
-                                k_states[idx] = (k_states[idx] * k_norm_factor) * k_norm_weight[d];
+                            size_t src_idx_v = i * kv_output_dim + h * head_dim + d;
+                            size_t dst_idx_v = i * num_key_value_heads * head_dim + h * head_dim + d;
+                            if (src_idx_v < v_states.size() && dst_idx_v < v_reshaped.size()) {
+                                v_reshaped[dst_idx_v] = v_states[src_idx_v];
                             }
                         }
                     }
                 }
                 
-                // 简化的注意力计算 (实际需要实现多头注意力和旋转位置编码)
-                std::vector<float> attn_output(seq_len * hidden_size, 0.0f);
+                // 应用q_norm/k_norm（在RoPE之前）
+                for (size_t i = 0; i < seq_len; ++i) {
+                    for (size_t h = 0; h < num_attention_heads; ++h) {
+                        float norm_factor = 0.0f;
+                        size_t start = i * num_attention_heads * head_dim + h * head_dim;
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            norm_factor += q_reshaped[start + d] * q_reshaped[start + d];
+                        }
+                        norm_factor = 1.0f / std::sqrt(norm_factor / head_dim + 1e-6f);
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            q_reshaped[start + d] *= norm_factor * q_norm_weight[d];
+                        }
+                    }
+                    
+                    for (size_t h = 0; h < num_key_value_heads; ++h) {
+                        float norm_factor = 0.0f;
+                        size_t start = i * num_key_value_heads * head_dim + h * head_dim;
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            norm_factor += k_reshaped[start + d] * k_reshaped[start + d];
+                        }
+                        norm_factor = 1.0f / std::sqrt(norm_factor / head_dim + 1e-6f);
+                        
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            k_reshaped[start + d] *= norm_factor * k_norm_weight[d];
+                        }
+                    }
+                }
                 
-                // 应用输出投影
-                attn_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    q_states, o_proj_weight, seq_len, hidden_size, hidden_size
+                // 调试输出：q_norm后
+                if (layer == 0) {
+                    size_t last_q = (seq_len - 1) * num_attention_heads * head_dim;
+                    size_t last_k = (seq_len - 1) * num_key_value_heads * head_dim;
+                    printf("DEBUG Layer 0 after q_norm Q[head0][last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    printf("DEBUG Layer 0 after k_norm K[head0][last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                }
+                
+                // 应用RoPE
+                apply_rope(q_reshaped, k_reshaped, seq_len, 
+                          num_attention_heads * head_dim, num_attention_heads,
+                          num_key_value_heads * head_dim, num_key_value_heads);
+                
+                // 调试输出：RoPE后
+                if (layer == 0) {
+                    size_t last_q = (seq_len - 1) * num_attention_heads * head_dim;
+                    size_t last_k = (seq_len - 1) * num_key_value_heads * head_dim;
+                    printf("DEBUG Layer 0 after RoPE Q[head0][last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                    printf("DEBUG Layer 0 after RoPE K[head0][last][:5] = [");
+                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
+                    printf("]\n");
+                }
+                
+                // GQA注意力计算
+                std::vector<float> attn_output(seq_len * q_output_dim, 0.0f);
+                
+                // 对每个Q头计算attention
+                for (size_t h = 0; h < num_attention_heads; ++h) {
+                    // GQA: 确定对应的K/V头索引
+                    size_t kv_head_idx = h / (num_attention_heads / num_key_value_heads);
+                    
+                    // 提取当前Q头 [seq_len, head_dim]
+                    std::vector<float> q_head(seq_len * head_dim);
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            q_head[i * head_dim + d] = q_reshaped[i * num_attention_heads * head_dim + h * head_dim + d];
+                        }
+                    }
+                    
+                    // 提取对应的K头 [seq_len, head_dim]
+                    std::vector<float> k_head(seq_len * head_dim);
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            k_head[i * head_dim + d] = k_reshaped[i * num_key_value_heads * head_dim + kv_head_idx * head_dim + d];
+                        }
+                    }
+                    
+                    // 提取对应的V头 [seq_len, head_dim]
+                    std::vector<float> v_head(seq_len * head_dim);
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            v_head[i * head_dim + d] = v_reshaped[i * num_key_value_heads * head_dim + kv_head_idx * head_dim + d];
+                        }
+                    }
+                    
+                    // 计算attention scores: Q @ K^T / sqrt(head_dim)
+                    std::vector<float> scores(seq_len * seq_len, 0.0f);
+                    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                    
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t j = 0; j < seq_len; ++j) {
+                            float score = 0.0f;
+                            for (size_t d = 0; d < head_dim; ++d) {
+                                score += q_head[i * head_dim + d] * k_head[j * head_dim + d];
+                            }
+                            scores[i * seq_len + j] = score * scale;
+                        }
+                    }
+                    
+                    // Softmax
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        float max_score = scores[i * seq_len];
+                        for (size_t j = 1; j < seq_len; ++j) {
+                            if (scores[i * seq_len + j] > max_score) {
+                                max_score = scores[i * seq_len + j];
+                            }
+                        }
+                        
+                        float sum = 0.0f;
+                        for (size_t j = 0; j < seq_len; ++j) {
+                            scores[i * seq_len + j] = std::exp(scores[i * seq_len + j] - max_score);
+                            sum += scores[i * seq_len + j];
+                        }
+                        
+                        for (size_t j = 0; j < seq_len; ++j) {
+                            scores[i * seq_len + j] /= sum;
+                        }
+                    }
+                    
+                    // Attention output: scores @ V
+                    std::vector<float> attn_head(seq_len * head_dim, 0.0f);
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            float val = 0.0f;
+                            for (size_t j = 0; j < seq_len; ++j) {
+                                val += scores[i * seq_len + j] * v_head[j * head_dim + d];
+                            }
+                            attn_head[i * head_dim + d] = val;
+                        }
+                    }
+                    
+                    // 将结果放入attn_output
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            attn_output[i * q_output_dim + h * head_dim + d] = attn_head[i * head_dim + d];
+                        }
+                    }
+                }
+                
+                // Reshape attn_output back to [seq_len, q_output_dim]
+                // 已经是正确的格式了
+                
+                // 应用输出投影 O: [seq_len, q_output_dim] × [hidden_size, q_output_dim]^T
+                std::vector<float> projected_output = cuda_matrix_ops.matrix_multiply_transpose(
+                    attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
                 );
                 
                 // 将注意力输出加到原始嵌入上
                 for (size_t i = 0; i < embedded.size(); ++i) {
-                    embedded[i] += attn_output[i];
+                    embedded[i] += projected_output[i];
                 }
             }
         }
@@ -534,15 +856,18 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             const std::vector<float>& up_proj_weight = weights[up_proj_key];
             const std::vector<float>& down_proj_weight = weights[down_proj_key];
             
+            // 从权重中获取intermediate_size
+            size_t intermediate_size = gate_proj_weight.size() / hidden_size;
+            
             // 执行MLP前馈网络
             // gate_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
             std::vector<float> gate_output = cuda_matrix_ops.matrix_multiply_transpose(
-                embedded, gate_proj_weight, seq_len, hidden_size, 3072  // 假设intermediate_size为3072
+                embedded, gate_proj_weight, seq_len, hidden_size, intermediate_size
             );
             
             // up_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
             std::vector<float> up_output = cuda_matrix_ops.matrix_multiply_transpose(
-                embedded, up_proj_weight, seq_len, hidden_size, 3072  // 假设intermediate_size为3072
+                embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
             );
             
             // 应用SiLU激活函数: x * sigmoid(x)
@@ -557,7 +882,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             
             // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
             std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
-                gate_output, down_proj_weight, seq_len, 3072, hidden_size
+                gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
             );
             
             // 将MLP输出加到嵌入上

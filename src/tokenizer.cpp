@@ -392,33 +392,34 @@ Qwen3Tokenizer::Qwen3Tokenizer(const std::string& tokenizer_json_path, const std
     
     // 设置特殊token ID - 从added_tokens中获取
     bos_token_id = -1;  // Qwen3默认没有BOS token
-    eos_token_id = 151645;  // Qwen3 EOS token (<|im_end|>)
-    unk_token_id = 151643;  // UNK token (<|endoftext|>)
-    pad_token_id = 151643;  // PAD token (<|endoftext|>)
-    
+    eos_token_id = 151645;  // Qwen3 EOS token (|im_end|>)
+    unk_token_id = 151643;  // UNK token (|endoftext|>)
+    pad_token_id = 151643;  // PAD token (|endoftext|>)
+        
     if (tokenizer_config.contains("added_tokens")) {
         const auto& added_tokens = tokenizer_config["added_tokens"];
         for (const auto& token_info : added_tokens) {
             if (token_info.contains("content") && token_info.contains("id")) {
                 std::string content = token_info["content"];
                 int token_id = token_info["id"];
-                
+                    
                 // 添加到词汇表中
                 vocab[content] = token_id;
                 id_to_token[token_id] = content;
-                
+                    
                 // 识别特殊token
                 if (content == "<|endoftext|>") {
                     // <|endoftext|> 用作 PAD 和 UNK，但不是 BOS
                     unk_token_id = token_id;
                     pad_token_id = token_id;
                     // bos_token_id 保持为 -1（没有BOS）
-                    eos_token_id = token_id;  // 默认EOS，但会被<|im_end|>覆盖
+                    // 注意：Qwen3的post_processor使用<|endoftext|>作为结束token，而不是<|im_end|>
+                    eos_token_id = token_id;  // 用于tokenizer编码时添加的结束token
                 } else if (content == "<|im_start|>") {
                     im_start_token_id = token_id;
                 } else if (content == "<|im_end|>") {
                     im_end_token_id = token_id;
-                    eos_token_id = token_id;  // Qwen3使用<|im_end|>作为EOS
+                    // 不将<|im_end|>设为eos_token_id，因为post_processor使用的是<|endoftext|>
                 }
             }
         }
@@ -600,6 +601,11 @@ static std::vector<std::string> apply_bpe_merges_fast(std::vector<std::string> t
     
     // 对每个merge规则，按顺序应用
     for (const auto& merge_str : merges_list) {
+        // 优化：如果只剩一个token，无法再合并，提前终止
+        if (tokens.size() <= 1) {
+            break;
+        }
+        
         size_t space_pos = merge_str.find(' ');
         if (space_pos == std::string::npos) continue;
         
@@ -611,10 +617,12 @@ static std::vector<std::string> apply_bpe_merges_fast(std::vector<std::string> t
         if (vocab.find(merged) == vocab.end()) continue;
         
         // 查找并合并所有匹配的pair
+        bool found_merge = false;
         for (size_t i = 0; i < tokens.size() - 1;) {
             if (tokens[i] == first && tokens[i+1] == second) {
                 tokens[i] = merged;
                 tokens.erase(tokens.begin() + i + 1);
+                found_merge = true;
                 // 不增加i，继续检查当前位置
             } else {
                 ++i;
@@ -636,11 +644,17 @@ std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
     // 步骤2: 对每个pre-token应用BPE
     std::vector<std::string> final_tokens;
     for (const auto& pre_token : pre_tokens) {
+        // 优化：如果pre-token直接在词汇表中，直接使用
+        if (vocab.find(pre_token) != vocab.end()) {
+            final_tokens.push_back(pre_token);
+            continue;
+        }
+        
         // 将pre-token转换为Unicode字符级别
         std::vector<std::string> char_tokens = text_to_unicode_chars(pre_token);
         
         // 应用BPE merges
-        if (!merges.empty()) {
+        if (!merges.empty() && char_tokens.size() > 1) {
             char_tokens = apply_bpe_merges_fast(char_tokens, merges, vocab);
         }
         
