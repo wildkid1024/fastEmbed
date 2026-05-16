@@ -5,6 +5,9 @@
 #include <cctype>
 #include <iostream>  // 添加此头文件以使用 std::cout
 #include <cstdint>  // 添加此头文件以使用 uint8_t
+#include <filesystem>  // 添加filesystem头文件
+#include <iomanip>  // 添加iomanip头文件以使用setw和setfill
+#include <chrono>  // 添加chrono头文件以进行性能测量
 
 BGETokenizer::BGETokenizer(const std::string& vocab_file) {
     std::ifstream file(vocab_file);
@@ -324,27 +327,7 @@ std::string XLMRobertaTokenizer::decode(const std::vector<int>& token_ids) {
 
 // Qwen3Tokenizer implementation - Hugging Face format constructor
 Qwen3Tokenizer::Qwen3Tokenizer(const std::string& tokenizer_json_path, const std::string& vocab_json_path) {
-    // 从vocab.json加载词汇表
-    std::ifstream vocab_file(vocab_json_path);
-    if (!vocab_file.is_open()) {
-        throw std::runtime_error("无法打开vocab.json文件: " + vocab_json_path);
-    }
-    
-    nlohmann::json vocab_json;
-    vocab_file >> vocab_json;
-    
-    if (vocab_json.is_object()) {
-        // vocab.json通常是对象格式: {"token": id, ...}
-        for (auto& [token, value] : vocab_json.items()) {
-            int id = value.get<int>();
-            vocab[token] = id;
-            id_to_token[id] = token;
-        }
-    } else {
-        throw std::runtime_error("vocab.json格式错误，应为对象格式");
-    }
-    
-    // 从tokenizer.json加载特殊token信息
+    // 首先尝试从tokenizer.json加载完整的tokenizer配置
     std::ifstream tokenizer_file(tokenizer_json_path);
     if (!tokenizer_file.is_open()) {
         throw std::runtime_error("无法打开tokenizer.json文件: " + tokenizer_json_path);
@@ -353,78 +336,319 @@ Qwen3Tokenizer::Qwen3Tokenizer(const std::string& tokenizer_json_path, const std
     nlohmann::json tokenizer_config;
     tokenizer_file >> tokenizer_config;
     
-    // 设置特殊token ID
-    if (tokenizer_config.contains("bos_token")) {
-        std::string bos_token = tokenizer_config["bos_token"];
-        auto it = vocab.find(bos_token);
-        bos_token_id = (it != vocab.end()) ? it->second : 1; // 默认值
+    // 从tokenizer.json的model部分加载词汇表和merges
+    if (tokenizer_config.contains("model")) {
+        const auto& model = tokenizer_config["model"];
+        
+        // 加载词汇表
+        if (model.contains("vocab")) {
+            for (auto& [token, value] : model["vocab"].items()) {
+                int id = value.get<int>();
+                vocab[token] = id;
+                id_to_token[id] = token;
+            }
+            std::cout << "从tokenizer.json加载了 " << vocab.size() << " 个词汇" << std::endl;
+        }
+        
+        // 加载BPE merges
+        if (model.contains("merges")) {
+            int merge_count = 0;
+            for (const auto& merge : model["merges"]) {
+                if (merge.is_array() && merge.size() == 2) {
+                    // 数组格式: ["token1", "token2"]
+                    std::string first = merge[0].get<std::string>();
+                    std::string second = merge[1].get<std::string>();
+                    merges.push_back(first + " " + second);
+                    merge_count++;
+                } else if (merge.is_string()) {
+                    // 字符串格式: "token1 token2"
+                    merges.push_back(merge.get<std::string>());
+                    merge_count++;
+                }
+            }
+            std::cout << "从tokenizer.json加载了 " << merge_count << " 个merges" << std::endl;
+        }
+    } else if (std::filesystem::exists(vocab_json_path)) {
+        // 如果tokenizer.json中没有model，尝试从vocab.json加载
+        std::ifstream vocab_file(vocab_json_path);
+        if (!vocab_file.is_open()) {
+            throw std::runtime_error("无法打开vocab.json文件: " + vocab_json_path);
+        }
+        
+        nlohmann::json vocab_json;
+        vocab_file >> vocab_json;
+        
+        if (vocab_json.is_object()) {
+            for (auto& [token, value] : vocab_json.items()) {
+                int id = value.get<int>();
+                vocab[token] = id;
+                id_to_token[id] = token;
+            }
+            std::cout << "从vocab.json加载了 " << vocab.size() << " 个词汇" << std::endl;
+        }
     } else {
-        bos_token_id = 1; // 默认值
+        throw std::runtime_error("无法找到有效的词汇表文件");
     }
     
-    if (tokenizer_config.contains("eos_token")) {
-        std::string eos_token = tokenizer_config["eos_token"];
-        auto it = vocab.find(eos_token);
-        eos_token_id = (it != vocab.end()) ? it->second : 2; // 默认值
-    } else {
-        eos_token_id = 2; // 默认值
-    }
+    // 设置特殊token ID - 从added_tokens中获取
+    bos_token_id = -1;  // Qwen3默认没有BOS token
+    eos_token_id = 151645;  // Qwen3 EOS token (<|im_end|>)
+    unk_token_id = 151643;  // UNK token (<|endoftext|>)
+    pad_token_id = 151643;  // PAD token (<|endoftext|>)
     
-    if (tokenizer_config.contains("unk_token")) {
-        std::string unk_token = tokenizer_config["unk_token"];
-        auto it = vocab.find(unk_token);
-        unk_token_id = (it != vocab.end()) ? it->second : 3; // 默认值
-    } else {
-        unk_token_id = 3; // 默认值
-    }
-    
-    if (tokenizer_config.contains("pad_token")) {
-        std::string pad_token = tokenizer_config["pad_token"];
-        auto it = vocab.find(pad_token);
-        pad_token_id = (it != vocab.end()) ? it->second : unk_token_id; // 默认使用unk_token_id
-    } else {
-        pad_token_id = unk_token_id; // 默认使用unk_token_id作为pad_token_id
-    }
-    
-    // 从tokenizer_config中获取Qwen3特有的特殊token
     if (tokenizer_config.contains("added_tokens")) {
         const auto& added_tokens = tokenizer_config["added_tokens"];
         for (const auto& token_info : added_tokens) {
-            if (token_info.contains("content")) {
+            if (token_info.contains("content") && token_info.contains("id")) {
                 std::string content = token_info["content"];
                 int token_id = token_info["id"];
                 
-                if (content == "") {
-                    chat_start_token_id = token_id;
-                } else if (content == "```") {
+                // 添加到词汇表中
+                vocab[content] = token_id;
+                id_to_token[token_id] = content;
+                
+                // 识别特殊token
+                if (content == "<|endoftext|>") {
+                    // <|endoftext|> 用作 PAD 和 UNK，但不是 BOS
+                    unk_token_id = token_id;
+                    pad_token_id = token_id;
+                    // bos_token_id 保持为 -1（没有BOS）
+                    eos_token_id = token_id;  // 默认EOS，但会被<|im_end|>覆盖
+                } else if (content == "<|im_start|>") {
                     im_start_token_id = token_id;
-                } else if (content == "```") {
+                } else if (content == "<|im_end|>") {
                     im_end_token_id = token_id;
+                    eos_token_id = token_id;  // Qwen3使用<|im_end|>作为EOS
                 }
             }
         }
-    } else {
-        // 设置默认值
-        chat_start_token_id = -1;
-        im_start_token_id = 151644;  // Qwen3默认值
-        im_end_token_id = 151645;    // Qwen3默认值
     }
+    
+    std::cout << "特殊Token IDs - BOS: " << bos_token_id << ", EOS: " << eos_token_id 
+              << ", UNK: " << unk_token_id << ", PAD: " << pad_token_id << std::endl;
+    std::cout << "词汇表大小: " << vocab.size() << std::endl;
 }
 
-std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
-    // 实现Hugging Face风格的分词逻辑
-    // 对于Qwen3，这可能涉及BPE分词
-    // 这里使用一个简化的分词实现，实际应用中可能需要更复杂的逻辑
+// Pre-tokenization: 使用正则表达式分割文本
+// 正则模式: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static std::vector<std::string> pre_tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     
-    // 简单的字符级分词作为备选方案
-    // 在实际应用中，应该实现完整的BPE分词算法
-    for (char c : text) {
-        std::string token(1, c);
-        tokens.push_back(token);
+    if (text.empty()) {
+        return tokens;
+    }
+    
+    // 简化的pre-tokenization实现：
+    // 1. 按空白字符分割，但将空格附加到下一个token前面
+    // 2. 保留标点符号作为独立tokens
+    // 3. 将空格字符(0x20)替换为特殊字符Ġ(U+0120)
+    
+    size_t i = 0;
+    size_t len = text.size();
+    std::string pending_spaces;  // 待处理的空格
+    
+    while (i < len) {
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        
+        // 跳过回车和换行符的特殊处理
+        if (c == '\r' || c == '\n') {
+            size_t start = i;
+            while (i < len && (text[i] == '\r' || text[i] == '\n')) {
+                i++;
+            }
+            std::string newline_token = pending_spaces + text.substr(start, i - start);
+            tokens.push_back(newline_token);
+            pending_spaces.clear();
+            continue;
+        }
+        
+        // 处理空白字符 - 收集但不立即添加
+        if (std::isspace(c)) {
+            size_t start = i;
+            while (i < len && std::isspace(static_cast<unsigned char>(text[i]))) {
+                i++;
+            }
+            // 将空格替换为Ġ (U+0120, UTF-8编码为0xC4 0xA0)
+            std::string gpt2_spaces;
+            for (size_t j = 0; j < (i - start); ++j) {
+                gpt2_spaces += "\xC4\xA0";  // Ġ的UTF-8编码
+            }
+            pending_spaces = gpt2_spaces;
+            continue;
+        }
+        
+        // 处理字母（包括UTF-8多字节字符）
+        if (std::isalpha(c) || (c > 127)) {
+            size_t start = i;
+            
+            // 收集连续的字母字符
+            while (i < len) {
+                unsigned char ch = static_cast<unsigned char>(text[i]);
+                if (std::isalpha(ch) || ch > 127 || ch == '\'') {
+                    // 处理UTF-8多字节字符
+                    if (ch > 127) {
+                        size_t char_len = 1;
+                        if ((ch & 0xE0) == 0xC0) char_len = 2;
+                        else if ((ch & 0xF0) == 0xE0) char_len = 3;
+                        else if ((ch & 0xF8) == 0xF0) char_len = 4;
+                        i += char_len;
+                    } else {
+                        i++;
+                    }
+                } else {
+                    break;
+                }
+            }
+            // 将待处理的空格作为前缀添加
+            std::string token = pending_spaces + text.substr(start, i - start);
+            tokens.push_back(token);
+            pending_spaces.clear();
+            continue;
+        }
+        
+        // 处理数字
+        if (std::isdigit(c)) {
+            size_t start = i;
+            while (i < len && std::isdigit(static_cast<unsigned char>(text[i]))) {
+                i++;
+            }
+            std::string token = pending_spaces + text.substr(start, i - start);
+            tokens.push_back(token);
+            pending_spaces.clear();
+            continue;
+        }
+        
+        // 处理标点符号和其他字符
+        {
+            size_t start = i;
+            
+            // 收集连续的标点符号
+            while (i < len) {
+                unsigned char ch = static_cast<unsigned char>(text[i]);
+                if (!std::isalnum(ch) && !std::isspace(ch) && ch != '\r' && ch != '\n') {
+                    if (ch > 127) {
+                        // UTF-8多字节字符
+                        size_t char_len = 1;
+                        if ((ch & 0xE0) == 0xC0) char_len = 2;
+                        else if ((ch & 0xF0) == 0xE0) char_len = 3;
+                        else if ((ch & 0xF8) == 0xF0) char_len = 4;
+                        i += char_len;
+                    } else {
+                        i++;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if (i > start) {
+                // 标点符号前可能有一个空格（根据正则表达式）
+                std::string token = pending_spaces + text.substr(start, i - start);
+                tokens.push_back(token);
+                pending_spaces.clear();
+            }
+            continue;
+        }
+    }
+    
+    // 如果最后还有未处理的空格，添加到末尾
+    if (!pending_spaces.empty()) {
+        tokens.push_back(pending_spaces);
     }
     
     return tokens;
+}
+
+// BPE编码辅助函数
+// 将文本转换为Unicode字符级别的tokens
+static std::vector<std::string> text_to_unicode_chars(const std::string& text) {
+    std::vector<std::string> tokens;
+    
+    size_t i = 0;
+    while (i < text.size()) {
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        size_t char_len = 1;
+        
+        // 确定UTF-8字符的字节数
+        if ((c & 0x80) == 0) {
+            char_len = 1;  // ASCII
+        } else if ((c & 0xE0) == 0xC0) {
+            char_len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            char_len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            char_len = 4;
+        }
+        
+        if (i + char_len > text.size()) {
+            char_len = text.size() - i;
+        }
+        
+        tokens.push_back(text.substr(i, char_len));
+        i += char_len;
+    }
+    
+    return tokens;
+}
+
+// 高效的BPE merges应用 - 严格按照merges顺序
+static std::vector<std::string> apply_bpe_merges_fast(std::vector<std::string> tokens,
+                                                       const std::vector<std::string>& merges_list,
+                                                       const std::unordered_map<std::string, int>& vocab) {
+    if (merges_list.empty() || tokens.empty()) {
+        return tokens;
+    }
+    
+    // 对每个merge规则，按顺序应用
+    for (const auto& merge_str : merges_list) {
+        size_t space_pos = merge_str.find(' ');
+        if (space_pos == std::string::npos) continue;
+        
+        std::string first = merge_str.substr(0, space_pos);
+        std::string second = merge_str.substr(space_pos + 1);
+        std::string merged = first + second;
+        
+        // 如果合并后不在词汇表中，跳过
+        if (vocab.find(merged) == vocab.end()) continue;
+        
+        // 查找并合并所有匹配的pair
+        for (size_t i = 0; i < tokens.size() - 1;) {
+            if (tokens[i] == first && tokens[i+1] == second) {
+                tokens[i] = merged;
+                tokens.erase(tokens.begin() + i + 1);
+                // 不增加i，继续检查当前位置
+            } else {
+                ++i;
+            }
+        }
+    }
+    
+    return tokens;
+}
+
+std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    
+    // 步骤1: Pre-tokenization - 按正则表达式分割文本
+    std::vector<std::string> pre_tokens = pre_tokenize(text);
+    
+    // 步骤2: 对每个pre-token应用BPE
+    std::vector<std::string> final_tokens;
+    for (const auto& pre_token : pre_tokens) {
+        // 将pre-token转换为Unicode字符级别
+        std::vector<std::string> char_tokens = text_to_unicode_chars(pre_token);
+        
+        // 应用BPE merges
+        if (!merges.empty()) {
+            char_tokens = apply_bpe_merges_fast(char_tokens, merges, vocab);
+        }
+        
+        // 合并到最终结果
+        final_tokens.insert(final_tokens.end(), char_tokens.begin(), char_tokens.end());
+    }
+    
+    return final_tokens;
 }
 
 std::vector<int> Qwen3Tokenizer::encode(const std::vector<std::string>& tokens) {
