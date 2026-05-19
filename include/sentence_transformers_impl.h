@@ -11,8 +11,9 @@
 #include "ops/cpu/cpu_attention_ops.h"
 #include "ops/cpu/cpu_matrix_ops.h"
 
-#include "ops/cuda/cuda_matrix_ops.h"
-#include "ops/cuda/cuda_attention_ops.cuh"
+// 临时注释掉CUDA相关头文件，使用CPU版本
+// #include "ops/cuda/cuda_matrix_ops.h"
+// #include "ops/cuda/cuda_attention_ops.cuh"
 
 using json = nlohmann::json;
 
@@ -37,9 +38,9 @@ private:
     // 注释掉未使用的CPU实例
     CPUAttentionOps cpu_attention_ops; 
     CPUMatrixOps cpu_matrix_ops; 
-    // 添加CUDA操作类实例
-    CUDAMatrixOps cuda_matrix_ops;
-    CUDAAttentionOps cuda_attention_ops;
+    // 临时注释掉CUDA操作类实例，使用CPU版本
+    // CUDAMatrixOps cuda_matrix_ops;
+    // CUDAAttentionOps cuda_attention_ops;
     nlohmann::json config;  // 添加 JSON 配置私有成员
 
     // Private helper functions
