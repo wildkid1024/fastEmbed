@@ -265,7 +265,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     // 应用嵌入层 LayerNorm（词嵌入 + 位置嵌入 + 段嵌入 后的归一化）
     const std::vector<float>& ln_weight = weights["embeddings.LayerNorm.weight"];
     const std::vector<float>& ln_bias = weights["embeddings.LayerNorm.bias"];
-    embedded = cpu_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim, epsilon);
+    embedded = cuda_matrix_ops.layer_norm(embedded, ln_weight, ln_bias, embedding_dim, epsilon);
 
     // {{ 预训练位置嵌入处理结束 }}
     
@@ -321,7 +321,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         // {{ 新增：注意力输出 Dense 层（修复未使用 weight 的问题）}}
         // 3. 矩阵乘法：attn_output（[seq_len, embedding_dim]） × 权重（[embedding_dim, embedding_dim]）
         size_t batch_seq_len = attn_output.size() / embedding_dim;
-        attn_output = cpu_matrix_ops.matrix_multiply_transpose(
+        attn_output = cuda_matrix_ops.matrix_multiply_transpose(
         attn_output, attn_dense_weight, batch_seq_len, embedding_dim, embedding_dim
         );
         
@@ -337,7 +337,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
         }
 
         // 层归一化
-        attn_output = cpu_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim, epsilon);
+        attn_output = cuda_matrix_ops.layer_norm(attn_output, ln_gamma, ln_beta, embedding_dim, epsilon);
 
         const int intermediate_dim = this->config["intermediate_size"];
 
@@ -366,7 +366,7 @@ std::vector<float> SentenceTransformerImpl::bge_forward(const std::vector<int32_
     /*
     // pooler.dense 池化，用于分类任务
     // 使用matrix_multiply_transpose替换手动矩阵乘法
-    std::vector<float> pooled = cpu_matrix_ops.matrix_multiply_transpose(
+    std::vector<float> pooled = cuda_matrix_ops.matrix_multiply_transpose(
         cls_output,  // 输入向量 [1, embedding_dim]
         pooler_weight,  // 权重矩阵 [embedding_dim, embedding_dim]
         1,  // batch_size
@@ -572,7 +572,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 printf("]\n");
             }
             
-            embedded = cpu_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+            embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
         } else {
             if (layer == 0) {
                 printf("DEBUG Layer 0 ERROR: input_layernorm.weight NOT FOUND! Key: %s\n", input_layernorm_weight_key.c_str());
@@ -631,16 +631,16 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 
                 // 执行Q、K、V投影（使用正确的维度）
                 // Q: [seq_len, hidden_size] x [hidden_size, q_output_dim]
-                std::vector<float> q_states = cpu_matrix_ops.matrix_multiply_transpose(
+                std::vector<float> q_states = cuda_matrix_ops.matrix_multiply_transpose(
                     embedded, q_proj_weight, seq_len, hidden_size, q_output_dim
                 );
                 
                 // K/V: [seq_len, hidden_size] x [hidden_size, kv_output_dim]
-                std::vector<float> k_states = cpu_matrix_ops.matrix_multiply_transpose(
+                std::vector<float> k_states = cuda_matrix_ops.matrix_multiply_transpose(
                     embedded, k_proj_weight, seq_len, hidden_size, kv_output_dim
                 );
                 
-                std::vector<float> v_states = cpu_matrix_ops.matrix_multiply_transpose(
+                std::vector<float> v_states = cuda_matrix_ops.matrix_multiply_transpose(
                     embedded, v_proj_weight, seq_len, hidden_size, kv_output_dim
                 );
                 
@@ -861,7 +861,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 // 已经是正确的格式了
                 
                 // 应用输出投影 O: [seq_len, q_output_dim] × [hidden_size, q_output_dim]^T
-                std::vector<float> projected_output = cpu_matrix_ops.matrix_multiply_transpose(
+                std::vector<float> projected_output = cuda_matrix_ops.matrix_multiply_transpose(
                     attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
                 );
                 
@@ -916,7 +916,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             const std::vector<float>& ln_weight = weights[post_attn_layernorm_key];
             float eps = this->config.value("rms_norm_eps", 1e-6f);
             
-            embedded = cpu_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
+            embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
             
             // 调试输出：post-attention LN后的值
             if (layer == 0) {
@@ -945,12 +945,12 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             
             // 执行MLP前馈网络
             // gate_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
-            std::vector<float> gate_output = cpu_matrix_ops.matrix_multiply_transpose(
+            std::vector<float> gate_output = cuda_matrix_ops.matrix_multiply_transpose(
                 embedded, gate_proj_weight, seq_len, hidden_size, intermediate_size
             );
             
             // up_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
-            std::vector<float> up_output = cpu_matrix_ops.matrix_multiply_transpose(
+            std::vector<float> up_output = cuda_matrix_ops.matrix_multiply_transpose(
                 embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
             );
             
@@ -993,7 +993,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             }
             
             // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
-            std::vector<float> mlp_output = cpu_matrix_ops.matrix_multiply_transpose(
+            std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
                 gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
             );
             
@@ -1045,7 +1045,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
         const std::vector<float>& final_norm_weight = weights["norm.weight"];
         float eps = this->config.value("rms_norm_eps", 1e-6f); // 使用配置中的rms_norm_eps值
         
-        embedded = cpu_matrix_ops.rms_norm(embedded, final_norm_weight, hidden_size, eps);
+        embedded = cuda_matrix_ops.rms_norm(embedded, final_norm_weight, hidden_size, eps);
     }
     
     // Qwen3使用last token pooling策略
@@ -1112,7 +1112,7 @@ std::vector<float> SentenceTransformerImpl::multi_head_attention(
     size_t embedding_dim
 ) {
     // 调用 CPUAttentionOps 的 multi_head_attention 方法
-    return cpu_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_heads, embedding_dim);
+    return cuda_attention_ops.multi_head_attention(input, weight_q, weight_k, weight_v, query_bias, key_bias, value_bias, num_heads, embedding_dim);
 }
 
 // 实现 SentenceTransformerImpl 的 feed_forward_network 函数
@@ -1131,7 +1131,7 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
     const float epsilon = this->config["layer_norm_eps"];
 
     // 第一层线性变换 - 替换为CUDA矩阵乘
-    std::vector<float> hidden = cpu_matrix_ops.matrix_multiply_transpose(
+    std::vector<float> hidden = cuda_matrix_ops.matrix_multiply_transpose(
         input, weight_ff_1, batch_seq_len, embedding_dim, intermediate_dim
     );
     
@@ -1142,17 +1142,17 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
 
     // 激活函数 - 替换为CUDA版本
     if (this->config["hidden_act"] == "gelu") {
-        hidden = cpu_matrix_ops.gelu(hidden);
+        hidden = cuda_matrix_ops.gelu(hidden);
     } else if (this->config["hidden_act"] == "relu") {
-        hidden = cpu_matrix_ops.relu(hidden);
+        hidden = cuda_matrix_ops.relu(hidden);
     } else if (this->config["hidden_act"] == "swish") {
-        hidden = cpu_matrix_ops.swish(hidden);
+        hidden = cuda_matrix_ops.swish(hidden);
     } else {
         throw std::runtime_error("Unsupported activation function");
     }
 
     // 第二层线性变换 - 替换为CUDA矩阵乘
-    std::vector<float> output = cpu_matrix_ops.matrix_multiply_transpose(
+    std::vector<float> output = cuda_matrix_ops.matrix_multiply_transpose(
         hidden, weight_ff_2, batch_seq_len, intermediate_dim, embedding_dim
     );
     
@@ -1165,7 +1165,7 @@ std::vector<float> SentenceTransformerImpl::feed_forward_network(const std::vect
     for (size_t i = 0; i < output.size(); ++i) {
         output[i] += input[i];  // 残差连接
     }
-    output = cpu_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim, epsilon);
+    output = cuda_matrix_ops.layer_norm(output, ln_gamma, ln_beta, embedding_dim, epsilon);
 
     return output;
 }
