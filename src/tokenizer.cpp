@@ -469,12 +469,9 @@ static std::vector<std::string> pre_tokenize(const std::string& text) {
             while (i < len && std::isspace(static_cast<unsigned char>(text[i]))) {
                 i++;
             }
-            // 将空格替换为Ġ (U+0120, UTF-8编码为0xC4 0xA0)
-            std::string gpt2_spaces;
-            for (size_t j = 0; j < (i - start); ++j) {
-                gpt2_spaces += "\xC4\xA0";  // Ġ的UTF-8编码
-            }
-            pending_spaces = gpt2_spaces;
+            // 注意：文本已经在tokenize函数中应用了bytes-to-unicode映射
+            // 空格(0x20)已经被映射为Ġ(U+0120)，所以这里直接使用原始字符
+            pending_spaces = text.substr(start, i - start);
             continue;
         }
         
@@ -591,45 +588,75 @@ static std::vector<std::string> text_to_unicode_chars(const std::string& text) {
     return tokens;
 }
 
-// 高效的BPE merges应用 - 严格按照merges顺序
+// Bytes-to-Unicode映射（GPT-2风格）
+static std::unordered_map<int, char32_t> build_bytes_to_unicode() {
+    std::unordered_map<int, char32_t> mapping;
+    
+    // !到~ (0x21-0x7E)
+    for (int i = 0x21; i <= 0x7E; ++i) {
+        mapping[i] = static_cast<char32_t>(i);
+    }
+    
+    // ¡到¬ (0xA1-0xAC)
+    for (int i = 0xA1; i <= 0xAC; ++i) {
+        mapping[i] = static_cast<char32_t>(i);
+    }
+    
+    // ®到ÿ (0xAE-0xFF)
+    for (int i = 0xAE; i <= 0xFF; ++i) {
+        mapping[i] = static_cast<char32_t>(i);
+    }
+    
+    // 其余字节映射到0x100+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (mapping.find(b) == mapping.end()) {
+            mapping[b] = static_cast<char32_t>(256 + n);
+            n++;
+        }
+    }
+    
+    return mapping;
+}
+
+// 正确的 BPE 合并实现：按照 merges 顺序依次应用
 static std::vector<std::string> apply_bpe_merges_fast(std::vector<std::string> tokens,
-                                                       const std::vector<std::string>& merges_list,
-                                                       const std::unordered_map<std::string, int>& vocab) {
-    if (merges_list.empty() || tokens.empty()) {
+                                                      const std::vector<std::string>& merges_list,
+                                                      const std::unordered_map<std::string, int>& vocab) {
+    if (merges_list.empty() || tokens.size() <= 1) {
         return tokens;
     }
-    
-    // 对每个merge规则，按顺序应用
+
+    // 对每个 merge 规则，依次尝试应用到 tokens
     for (const auto& merge_str : merges_list) {
-        // 优化：如果只剩一个token，无法再合并，提前终止
-        if (tokens.size() <= 1) {
-            break;
-        }
+        size_t pos = merge_str.find(' ');
+        if (pos == std::string::npos) continue;
         
-        size_t space_pos = merge_str.find(' ');
-        if (space_pos == std::string::npos) continue;
+        std::string first = merge_str.substr(0, pos);
+        std::string second = merge_str.substr(pos + 1);
         
-        std::string first = merge_str.substr(0, space_pos);
-        std::string second = merge_str.substr(space_pos + 1);
-        std::string merged = first + second;
+        // 尝试在 tokens 中找到 first + second 的 pair 并合并
+        std::vector<std::string> new_tokens;
+        bool merged = false;
         
-        // 如果合并后不在词汇表中，跳过
-        if (vocab.find(merged) == vocab.end()) continue;
-        
-        // 查找并合并所有匹配的pair
-        bool found_merge = false;
-        for (size_t i = 0; i < tokens.size() - 1;) {
-            if (tokens[i] == first && tokens[i+1] == second) {
-                tokens[i] = merged;
-                tokens.erase(tokens.begin() + i + 1);
-                found_merge = true;
-                // 不增加i，继续检查当前位置
+        for (size_t i = 0; i < tokens.size();) {
+            if (i + 1 < tokens.size() && tokens[i] == first && tokens[i+1] == second) {
+                // 找到匹配的 pair，合并它们
+                new_tokens.push_back(first + second);
+                i += 2;
+                merged = true;
             } else {
-                ++i;
+                new_tokens.push_back(tokens[i]);
+                i++;
             }
         }
+        
+        if (merged) {
+            tokens.swap(new_tokens);
+            if (tokens.size() <= 1) break;  // 如果只剩一个token，提前结束
+        }
     }
-    
+
     return tokens;
 }
 
@@ -638,8 +665,35 @@ std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
         return {};
     }
     
+    // 步骤0: 对整个文本应用bytes-to-unicode映射
+    static auto bytes_to_unicode = build_bytes_to_unicode();
+    std::string mapped_text;
+    for (unsigned char c : text) {
+        char32_t mapped_char = bytes_to_unicode[c];
+        
+        // 将char32_t转换为UTF-8字符串
+        if (mapped_char < 0x80) {
+            mapped_text += static_cast<char>(mapped_char);
+        } else if (mapped_char < 0x800) {
+            mapped_text += static_cast<char>(0xC0 | (mapped_char >> 6));
+            mapped_text += static_cast<char>(0x80 | (mapped_char & 0x3F));
+        } else if (mapped_char < 0x10000) {
+            mapped_text += static_cast<char>(0xE0 | (mapped_char >> 12));
+            mapped_text += static_cast<char>(0x80 | ((mapped_char >> 6) & 0x3F));
+            mapped_text += static_cast<char>(0x80 | (mapped_char & 0x3F));
+        }
+    }
+    
     // 步骤1: Pre-tokenization - 按正则表达式分割文本
-    std::vector<std::string> pre_tokens = pre_tokenize(text);
+    std::vector<std::string> pre_tokens = pre_tokenize(mapped_text);
+    
+    static bool debug_enabled = true;
+    if (debug_enabled) {
+        printf("DEBUG tokenize: text='%s', pre_tokens count=%zu\n", text.c_str(), pre_tokens.size());
+        for (size_t i = 0; i < pre_tokens.size(); ++i) {
+            printf("  pre_token[%zu] = '%s'\n", i, pre_tokens[i].c_str());
+        }
+    }
     
     // 步骤2: 对每个pre-token应用BPE
     std::vector<std::string> final_tokens;
@@ -650,8 +704,27 @@ std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
             continue;
         }
         
-        // 将pre-token转换为Unicode字符级别
-        std::vector<std::string> char_tokens = text_to_unicode_chars(pre_token);
+        // 将pre-token转换为字符级别（每个UTF-8字符作为一个token）
+        std::vector<std::string> char_tokens;
+        
+        // 解析UTF-8字符串为单个字符
+        size_t idx = 0;
+        while (idx < pre_token.size()) {
+            unsigned char c = static_cast<unsigned char>(pre_token[idx]);
+            size_t char_len = 1;
+            if ((c & 0x80) == 0) {
+                char_len = 1;
+            } else if ((c & 0xE0) == 0xC0) {
+                char_len = 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                char_len = 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                char_len = 4;
+            }
+            
+            char_tokens.push_back(pre_token.substr(idx, char_len));
+            idx += char_len;
+        }
         
         // 应用BPE merges
         if (!merges.empty() && char_tokens.size() > 1) {
