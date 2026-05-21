@@ -810,6 +810,13 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                         }
                     }
                     
+                    // 应用causal mask（下三角mask）：防止看到未来的token
+                    for (size_t i = 0; i < seq_len; ++i) {
+                        for (size_t j = i + 1; j < seq_len; ++j) {
+                            scores[i * seq_len + j] = -1e9;  // 设置为负无穷
+                        }
+                    }
+                    
                     // Softmax
                     for (size_t i = 0; i < seq_len; ++i) {
                         float max_score = scores[i * seq_len];
