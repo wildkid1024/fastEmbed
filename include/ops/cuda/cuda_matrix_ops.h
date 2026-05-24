@@ -34,6 +34,9 @@ public:
     
     // 向量相加（用于残差连接）
     std::vector<float> vector_add(const std::vector<float>& a, const std::vector<float>& b);
+    
+    // 融合操作：SiLU激活 + 逐元素相乘 (用于MLP的gate * up)
+    std::vector<float> silu_multiply(const std::vector<float>& gate_output, const std::vector<float>& up_output);
 
     // CUDA资源管理
     ~CUDAMatrixOps();

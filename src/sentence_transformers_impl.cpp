@@ -640,20 +640,13 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                     embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
                 );
             
-            
-            // 应用SiLU激活函数: x * sigmoid(x) (使用GPU加速)
-            gate_output = cuda_matrix_ops.silu(gate_output);
-            
-            
-            // 逐元素相乘
-            for (size_t i = 0; i < gate_output.size(); ++i) {
-                gate_output[i] *= up_output[i];
-            }
+            // 融合操作：SiLU(gate_output) * up_output (使用GPU融合kernel)
+            std::vector<float> gate_up_output = cuda_matrix_ops.silu_multiply(gate_output, up_output);
             
             
             // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
             std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
+                    gate_up_output, down_proj_weight, seq_len, intermediate_size, hidden_size
                 );
             
             

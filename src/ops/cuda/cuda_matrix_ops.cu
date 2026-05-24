@@ -533,6 +533,19 @@ __global__ void vector_add_kernel(const float* a, const float* b, float* result,
     }
 }
 
+// 融合kernel: SiLU(gate) * up
+// gate_output和up_output都是 [seq_len, intermediate_size]
+__global__ void silu_multiply_kernel(const float* gate, const float* up, float* result, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float g = gate[idx];
+        // SiLU: x * sigmoid(x)
+        float silu_g = g / (1.0f + expf(-g));
+        // element-wise multiply
+        result[idx] = silu_g * up[idx];
+    }
+}
+
 // 向量相加方法（用于残差连接）
 std::vector<float> CUDAMatrixOps::vector_add(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) {
@@ -567,6 +580,45 @@ std::vector<float> CUDAMatrixOps::vector_add(const std::vector<float>& a, const 
     // 释放GPU内存
     CHECK_CUDA_ERROR(cudaFree(d_a));
     CHECK_CUDA_ERROR(cudaFree(d_b));
+    CHECK_CUDA_ERROR(cudaFree(d_result));
+    
+    return result;
+}
+
+// 融合操作：SiLU(gate) * up
+std::vector<float> CUDAMatrixOps::silu_multiply(const std::vector<float>& gate_output, const std::vector<float>& up_output) {
+    if (gate_output.size() != up_output.size()) {
+        throw std::invalid_argument("Gate and Up output sizes must match");
+    }
+    
+    size_t size = gate_output.size();
+    std::vector<float> result(size);
+    
+    // 分配GPU内存
+    float *d_gate, *d_up, *d_result;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_gate, size * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_up, size * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_result, size * sizeof(float)));
+    
+    // 复制数据到GPU
+    CHECK_CUDA_ERROR(cudaMemcpy(d_gate, gate_output.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_up, up_output.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // 配置kernel参数
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    
+    // 执行融合操作: SiLU(gate) * up
+    silu_multiply_kernel<<<gridSize, blockSize>>>(d_gate, d_up, d_result, size);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    
+    // 复制结果回主机
+    CHECK_CUDA_ERROR(cudaMemcpy(result.data(), d_result, size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // 释放GPU内存
+    CHECK_CUDA_ERROR(cudaFree(d_gate));
+    CHECK_CUDA_ERROR(cudaFree(d_up));
     CHECK_CUDA_ERROR(cudaFree(d_result));
     
     return result;
