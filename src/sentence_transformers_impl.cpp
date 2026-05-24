@@ -492,6 +492,8 @@ static void apply_rope(std::vector<float>& q_states, std::vector<float>& k_state
 
 // Qwen3模型的前向传播
 std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int32_t>& tokens) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
     // 获取词嵌入
     std::vector<float> embedded = embedding_layer(tokens);
     size_t seq_len = tokens.size();
@@ -579,178 +581,13 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                         embedded, v_proj_weight, seq_len, hidden_size, kv_output_dim
                     );
                 
-                
-               
-                
-                // Reshape Q/K/V为多头格式: [seq_len, num_heads, head_dim]
-                // 存储为 [seq_len * num_heads * head_dim]
-                std::vector<float> q_reshaped(seq_len * num_attention_heads * head_dim);
-                std::vector<float> k_reshaped(seq_len * num_key_value_heads * head_dim);
-                std::vector<float> v_reshaped(seq_len * num_key_value_heads * head_dim);
-                
-                // printf("DEBUG: q_output_dim=%zu, kv_output_dim=%zu, head_dim=%zu\n", q_output_dim, kv_output_dim, head_dim);
-                // printf("DEBUG: q_reshaped size=%zu, expected=%zu\n", q_reshaped.size(), seq_len * num_attention_heads * head_dim);
-                
-                for (size_t i = 0; i < seq_len; ++i) {
-                    for (size_t h = 0; h < num_attention_heads; ++h) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            size_t src_idx = i * q_output_dim + h * head_dim + d;
-                            size_t dst_idx = i * num_attention_heads * head_dim + h * head_dim + d;
-                            if (src_idx < q_states.size() && dst_idx < q_reshaped.size()) {
-                                q_reshaped[dst_idx] = q_states[src_idx];
-                            }
-                        }
-                    }
-                    for (size_t h = 0; h < num_key_value_heads; ++h) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            size_t src_idx_k = i * kv_output_dim + h * head_dim + d;
-                            size_t dst_idx_k = i * num_key_value_heads * head_dim + h * head_dim + d;
-                            if (src_idx_k < k_states.size() && dst_idx_k < k_reshaped.size()) {
-                                k_reshaped[dst_idx_k] = k_states[src_idx_k];
-                            }
-                            
-                            size_t src_idx_v = i * kv_output_dim + h * head_dim + d;
-                            size_t dst_idx_v = i * num_key_value_heads * head_dim + h * head_dim + d;
-                            if (src_idx_v < v_states.size() && dst_idx_v < v_reshaped.size()) {
-                                v_reshaped[dst_idx_v] = v_states[src_idx_v];
-                            }
-                        }
-                    }
-                }
-                
-                // 应用q_norm/k_norm（在RoPE之前）
-                for (size_t i = 0; i < seq_len; ++i) {
-                    for (size_t h = 0; h < num_attention_heads; ++h) {
-                        float norm_factor = 0.0f;
-                        size_t start = i * num_attention_heads * head_dim + h * head_dim;
-                        
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            norm_factor += q_reshaped[start + d] * q_reshaped[start + d];
-                        }
-                        norm_factor = 1.0f / std::sqrt(norm_factor / head_dim + 1e-6f);
-                        
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            q_reshaped[start + d] *= norm_factor * q_norm_weight[d];
-                        }
-                    }
-                    
-                    for (size_t h = 0; h < num_key_value_heads; ++h) {
-                        float norm_factor = 0.0f;
-                        size_t start = i * num_key_value_heads * head_dim + h * head_dim;
-                        
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            norm_factor += k_reshaped[start + d] * k_reshaped[start + d];
-                        }
-                        norm_factor = 1.0f / std::sqrt(norm_factor / head_dim + 1e-6f);
-                        
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            k_reshaped[start + d] *= norm_factor * k_norm_weight[d];
-                        }
-                    }
-                }
-                
-                
-                // 应用RoPE
-                apply_rope(q_reshaped, k_reshaped, seq_len, 
-                          num_attention_heads * head_dim, num_attention_heads,
-                          num_key_value_heads * head_dim, num_key_value_heads);
-                
-                
-                // GQA注意力计算
-                std::vector<float> attn_output(seq_len * q_output_dim, 0.0f);
-                
-                // 对每个Q头计算attention
-                for (size_t h = 0; h < num_attention_heads; ++h) {
-                    // GQA: 确定对应的K/V头索引
-                    size_t kv_head_idx = h / (num_attention_heads / num_key_value_heads);
-                    
-                    // 提取当前Q头 [seq_len, head_dim]
-                    std::vector<float> q_head(seq_len * head_dim);
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            q_head[i * head_dim + d] = q_reshaped[i * num_attention_heads * head_dim + h * head_dim + d];
-                        }
-                    }
-                    
-                    // 提取对应的K头 [seq_len, head_dim]
-                    std::vector<float> k_head(seq_len * head_dim);
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            k_head[i * head_dim + d] = k_reshaped[i * num_key_value_heads * head_dim + kv_head_idx * head_dim + d];
-                        }
-                    }
-                    
-                    // 提取对应的V头 [seq_len, head_dim]
-                    std::vector<float> v_head(seq_len * head_dim);
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            v_head[i * head_dim + d] = v_reshaped[i * num_key_value_heads * head_dim + kv_head_idx * head_dim + d];
-                        }
-                    }
-                    
-                    // 计算attention scores: Q @ K^T / sqrt(head_dim)
-                    std::vector<float> scores(seq_len * seq_len, 0.0f);
-                    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-                    
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t j = 0; j < seq_len; ++j) {
-                            float score = 0.0f;
-                            for (size_t d = 0; d < head_dim; ++d) {
-                                score += q_head[i * head_dim + d] * k_head[j * head_dim + d];
-                            }
-                            scores[i * seq_len + j] = score * scale;
-                        }
-                    }
-                    
-                    // 应用causal mask（下三角mask）：防止看到未来的token
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t j = i + 1; j < seq_len; ++j) {
-                            scores[i * seq_len + j] = -1e9;  // 设置为负无穷
-                        }
-                    }
-                    
-                    // Softmax
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        float max_score = scores[i * seq_len];
-                        for (size_t j = 1; j < seq_len; ++j) {
-                            if (scores[i * seq_len + j] > max_score) {
-                                max_score = scores[i * seq_len + j];
-                            }
-                        }
-                        
-                        float sum = 0.0f;
-                        for (size_t j = 0; j < seq_len; ++j) {
-                            scores[i * seq_len + j] = std::exp(scores[i * seq_len + j] - max_score);
-                            sum += scores[i * seq_len + j];
-                        }
-                        
-                        for (size_t j = 0; j < seq_len; ++j) {
-                            scores[i * seq_len + j] /= sum;
-                        }
-                    }
-                    
-                    // Attention output: scores @ V
-                    std::vector<float> attn_head(seq_len * head_dim, 0.0f);
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            float val = 0.0f;
-                            for (size_t j = 0; j < seq_len; ++j) {
-                                val += scores[i * seq_len + j] * v_head[j * head_dim + d];
-                                }
-                                attn_head[i * head_dim + d] = val;
-                        }
-                    }
-                    
-                    // 将结果放入attn_output
-                    for (size_t i = 0; i < seq_len; ++i) {
-                        for (size_t d = 0; d < head_dim; ++d) {
-                            attn_output[i * q_output_dim + h * head_dim + d] = attn_head[i * head_dim + d];
-                        }
-                    }
-                }
-                
-                // Reshape attn_output back to [seq_len, q_output_dim]
-                // 已经是正确的格式了
+                // GQA注意力计算 - 使用CUDA加速
+                // q_norm、RoPE和reshape/permute都在GPU内部完成
+                std::vector<float> attn_output = cuda_attention_ops.grouped_query_attention(
+                    q_states, k_states, v_states,
+                    q_norm_weight, k_norm_weight,
+                    seq_len, num_attention_heads, num_key_value_heads, head_dim
+                );
                 
                 // 应用输出投影 O: [seq_len, q_output_dim] × [hidden_size, q_output_dim]^T
                 std::vector<float> projected_output = cuda_matrix_ops.matrix_multiply_transpose(
@@ -855,10 +692,10 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             }
         }
         
-    // auto end_time = std::chrono::high_resolution_clock::now();
-    // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    // printf("[C++ Inference Time] %lld ms\n", static_cast<long long>(duration.count()));
-    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    printf("[C++ Inference Time] %lld ms\n", static_cast<long long>(duration.count()));
+        
     return pooled_output;
 }
 

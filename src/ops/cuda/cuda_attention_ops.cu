@@ -44,6 +44,83 @@ __global__ void unpermute_kernel(const float* input, float* output, int B, int T
     }
 }
 
+// Q/K RMS Normalization kernel
+// 输入: [seq_len, num_heads * head_dim]
+// 对每个head独立进行RMS norm，然后乘以weight
+__global__ void rms_norm_head_kernel(
+    float* data,              // [seq_len, num_heads * head_dim], in-place
+    const float* weight,      // [head_dim]
+    int seq_len,
+    int num_heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_heads = seq_len * num_heads;
+    
+    if (idx >= total_heads) return;
+    
+    int seq_idx = idx / num_heads;  // 序列位置
+    int head_idx = idx % num_heads;  // head索引
+    
+    // 计算当前head的起始位置
+    int start = seq_idx * num_heads * head_dim + head_idx * head_dim;
+    
+    // 计算RMS
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        float val = data[start + d];
+        sum_sq += val * val;
+    }
+    
+    float rms = sqrtf(sum_sq / head_dim + 1e-6f);
+    float scale = 1.0f / rms;
+    
+    // 应用normalization和weight
+    for (int d = 0; d < head_dim; ++d) {
+        data[start + d] = data[start + d] * scale * weight[d];
+    }
+}
+
+// RoPE (Rotary Positional Embedding) kernel
+// 输入: [seq_len, num_heads * head_dim]
+// 对每个位置的每个head应用旋转位置编码
+__global__ void rope_kernel(
+    float* data,              // [seq_len, num_heads * head_dim], in-place
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    float rope_theta
+) {
+    // 每个thread处理一个(seq_pos, head)组合的一半维度
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_positions = seq_len * num_heads;
+    
+    if (idx >= total_positions) return;
+    
+    int pos = idx / num_heads;       // 序列位置
+    int head = idx % num_heads;      // head索引
+    
+    int half_dim = head_dim / 2;
+    int base_idx = pos * num_heads * head_dim + head * head_dim;
+    
+    // 对每一对维度应用RoPE
+    for (int d = 0; d < half_dim; ++d) {
+        // 计算cos/sin
+        float inv_freq = 1.0f / powf(rope_theta, 2.0f * static_cast<float>(d) / static_cast<float>(head_dim));
+        float theta = static_cast<float>(pos) * inv_freq;
+        float cos_val = cosf(theta);
+        float sin_val = sinf(theta);
+        
+        // 获取原始值
+        float x0 = data[base_idx + d];
+        float x1 = data[base_idx + d + half_dim];
+        
+        // 应用旋转: x' = x * cos - rotate(x) * sin
+        data[base_idx + d] = x0 * cos_val - x1 * sin_val;
+        data[base_idx + d + half_dim] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
 // 实现数值稳定的softmax
 __global__ void softmax_forward_kernel(const float* d_scores, float scale, float* d_preatt, int batch_heads, int seq_len) {
     // 解析三维grid索引
@@ -338,5 +415,217 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
     CHECK_CUDA_ERROR(cudaFree(d_v));
     CHECK_CUDA_ERROR(cudaFree(d_output));
 
+    return output;
+}
+
+// GQA (Grouped Query Attention) 实现
+std::vector<float> CUDAAttentionOps::grouped_query_attention(
+    const std::vector<float>& q_input,       // [seq_len, num_q_heads * head_dim]
+    const std::vector<float>& k_input,       // [seq_len, num_kv_heads * head_dim]
+    const std::vector<float>& v_input,       // [seq_len, num_kv_heads * head_dim]
+    const std::vector<float>& q_norm_weight, // [head_dim]
+    const std::vector<float>& k_norm_weight, // [head_dim]
+    size_t seq_len,
+    size_t num_q_heads,
+    size_t num_kv_heads,
+    size_t head_dim
+) {
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const size_t q_output_dim = num_q_heads * head_dim;
+    const size_t kv_output_dim = num_kv_heads * head_dim;
+    
+    // Device pointers
+    float *d_q, *d_k, *d_v, *d_output;
+    const size_t q_size = seq_len * q_output_dim * sizeof(float);
+    const size_t kv_size = seq_len * kv_output_dim * sizeof(float);
+    const size_t output_size = seq_len * q_output_dim * sizeof(float);
+    
+    // Allocate device memory
+    CHECK_CUDA_ERROR(cudaMalloc(&d_q, q_size));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_k, kv_size));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_v, kv_size));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_output, output_size));
+    
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_q, q_input.data(), q_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_k, k_input.data(), kv_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_v, v_input.data(), kv_size, cudaMemcpyHostToDevice));
+    
+    // Copy norm weights to device
+    float *d_q_norm_weight, *d_k_norm_weight;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_q_norm_weight, head_dim * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_k_norm_weight, head_dim * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_q_norm_weight, q_norm_weight.data(), head_dim * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_k_norm_weight, k_norm_weight.data(), head_dim * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // Apply Q/K RMS normalization on GPU (before RoPE)
+    int norm_block_size = 256;
+    int q_norm_grid_size = (seq_len * num_q_heads + norm_block_size - 1) / norm_block_size;
+    int k_norm_grid_size = (seq_len * num_kv_heads + norm_block_size - 1) / norm_block_size;
+    
+    rms_norm_head_kernel<<<q_norm_grid_size, norm_block_size>>>(d_q, d_q_norm_weight, seq_len, num_q_heads, head_dim);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    rms_norm_head_kernel<<<k_norm_grid_size, norm_block_size>>>(d_k, d_k_norm_weight, seq_len, num_kv_heads, head_dim);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Free norm weight memory
+    CHECK_CUDA_ERROR(cudaFree(d_q_norm_weight));
+    CHECK_CUDA_ERROR(cudaFree(d_k_norm_weight));
+    
+    // Apply RoPE on GPU (after q_norm)
+    float rope_theta = 1000000.0f;
+    int rope_block_size = 256;
+    int q_rope_grid_size = (seq_len * num_q_heads + rope_block_size - 1) / rope_block_size;
+    int k_rope_grid_size = (seq_len * num_kv_heads + rope_block_size - 1) / rope_block_size;
+    
+    rope_kernel<<<q_rope_grid_size, rope_block_size>>>(d_q, seq_len, num_q_heads, head_dim, rope_theta);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    rope_kernel<<<k_rope_grid_size, rope_block_size>>>(d_k, seq_len, num_kv_heads, head_dim, rope_theta);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Reshape Q/K/V: [seq_len, num_heads * head_dim] -> [num_heads, seq_len, head_dim]
+    float *d_q_reshaped, *d_k_reshaped, *d_v_reshaped;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_q_reshaped, num_q_heads * seq_len * head_dim * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_k_reshaped, num_kv_heads * seq_len * head_dim * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_v_reshaped, num_kv_heads * seq_len * head_dim * sizeof(float)));
+    
+    // Permute Q: [seq_len, num_q_heads, head_dim] -> [num_q_heads, seq_len, head_dim]
+    int permute_block_size = 256;
+    int permute_grid_size = (seq_len * num_q_heads * head_dim + permute_block_size - 1) / permute_block_size;
+    permute_kernel<<<permute_grid_size, permute_block_size>>>(d_q, d_q_reshaped, 1, seq_len, num_q_heads, head_dim);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Permute K/V: [seq_len, num_kv_heads, head_dim] -> [num_kv_heads, seq_len, head_dim]
+    permute_grid_size = (seq_len * num_kv_heads * head_dim + permute_block_size - 1) / permute_block_size;
+    permute_kernel<<<permute_grid_size, permute_block_size>>>(d_k, d_k_reshaped, 1, seq_len, num_kv_heads, head_dim);
+    permute_kernel<<<permute_grid_size, permute_block_size>>>(d_v, d_v_reshaped, 1, seq_len, num_kv_heads, head_dim);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // For each Q head, compute attention with corresponding KV head (GQA)
+    float *d_attn_output_all;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_attn_output_all, num_q_heads * seq_len * head_dim * sizeof(float)));
+    
+    // Process each Q head
+    for (size_t h = 0; h < num_q_heads; ++h) {
+        // GQA: determine corresponding KV head index
+        size_t kv_head_idx = h / (num_q_heads / num_kv_heads);
+        
+        // Extract current Q head [seq_len, head_dim]
+        float *d_q_head;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_q_head, seq_len * head_dim * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMemcpy(d_q_head, 
+            d_q_reshaped + h * seq_len * head_dim, 
+            seq_len * head_dim * sizeof(float), 
+            cudaMemcpyDeviceToDevice));
+        
+        // Extract corresponding K head [seq_len, head_dim]
+        float *d_k_head;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_k_head, seq_len * head_dim * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMemcpy(d_k_head, 
+            d_k_reshaped + kv_head_idx * seq_len * head_dim, 
+            seq_len * head_dim * sizeof(float), 
+            cudaMemcpyDeviceToDevice));
+        
+        // Extract corresponding V head [seq_len, head_dim]
+        float *d_v_head;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_v_head, seq_len * head_dim * sizeof(float)));
+        CHECK_CUDA_ERROR(cudaMemcpy(d_v_head, 
+            d_v_reshaped + kv_head_idx * seq_len * head_dim, 
+            seq_len * head_dim * sizeof(float), 
+            cudaMemcpyDeviceToDevice));
+        
+        // Compute attention scores: Q @ K^T [seq_len, seq_len]
+        float *d_scores;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_scores, seq_len * seq_len * sizeof(float)));
+        
+        dim3 matmul_block_size(32, 32);
+        dim3 matmul_grid_size(
+            (seq_len + matmul_block_size.x - 1) / matmul_block_size.x,
+            (seq_len + matmul_block_size.y - 1) / matmul_block_size.y
+        );
+        batched_matmul_kernel<<<matmul_grid_size, matmul_block_size>>>(
+            d_q_head, d_k_head, d_scores, 
+            1, seq_len, head_dim, seq_len, true
+        );
+        CHECK_CUDA_ERROR(cudaGetLastError());
+        
+        // Apply causal mask and softmax
+        float *d_preatt;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_preatt, seq_len * seq_len * sizeof(float)));
+        
+        // Apply causal mask on host (for simplicity, can be optimized with CUDA kernel)
+        std::vector<float> scores(seq_len * seq_len);
+        CHECK_CUDA_ERROR(cudaMemcpy(scores.data(), d_scores, seq_len * seq_len * sizeof(float), cudaMemcpyDeviceToHost));
+        
+        for (size_t i = 0; i < seq_len; ++i) {
+            for (size_t j = i + 1; j < seq_len; ++j) {
+                scores[i * seq_len + j] = -1e9;
+            }
+        }
+        
+        CHECK_CUDA_ERROR(cudaMemcpy(d_scores, scores.data(), seq_len * seq_len * sizeof(float), cudaMemcpyHostToDevice));
+        
+        // Softmax
+        dim3 softmax_grid_size(1, seq_len, 1);
+        int softmax_block_size = (seq_len + 31) / 32 * 32;
+        softmax_forward_kernel<<<softmax_grid_size, softmax_block_size, 2 * softmax_block_size * sizeof(float)>>>(
+            d_scores, scale, d_preatt, 1, seq_len
+        );
+        CHECK_CUDA_ERROR(cudaGetLastError());
+        
+        // Attention output: preatt @ V [seq_len, head_dim]
+        float *d_attn_head;
+        CHECK_CUDA_ERROR(cudaMalloc(&d_attn_head, seq_len * head_dim * sizeof(float)));
+        
+        dim3 attn_grid_size(
+            (head_dim + matmul_block_size.x - 1) / matmul_block_size.x,
+            (seq_len + matmul_block_size.y - 1) / matmul_block_size.y
+        );
+        batched_matmul_kernel<<<attn_grid_size, matmul_block_size>>>(
+            d_preatt, d_v_head, d_attn_head, 
+            1, seq_len, seq_len, head_dim
+        );
+        CHECK_CUDA_ERROR(cudaGetLastError());
+        
+        // Copy result to output buffer
+        CHECK_CUDA_ERROR(cudaMemcpy(
+            d_attn_output_all + h * seq_len * head_dim,
+            d_attn_head,
+            seq_len * head_dim * sizeof(float),
+            cudaMemcpyDeviceToDevice
+        ));
+        
+        // Free temporary buffers
+        CHECK_CUDA_ERROR(cudaFree(d_q_head));
+        CHECK_CUDA_ERROR(cudaFree(d_k_head));
+        CHECK_CUDA_ERROR(cudaFree(d_v_head));
+        CHECK_CUDA_ERROR(cudaFree(d_scores));
+        CHECK_CUDA_ERROR(cudaFree(d_preatt));
+        CHECK_CUDA_ERROR(cudaFree(d_attn_head));
+    }
+    
+    // Unpermute output: [num_q_heads, seq_len, head_dim] -> [seq_len, num_q_heads * head_dim]
+    int unpermute_grid_size = (seq_len * num_q_heads * head_dim + permute_block_size - 1) / permute_block_size;
+    unpermute_kernel<<<unpermute_grid_size, permute_block_size>>>(
+        d_attn_output_all, d_output, 1, seq_len, num_q_heads, head_dim
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Copy result back to host
+    std::vector<float> output(seq_len * q_output_dim);
+    CHECK_CUDA_ERROR(cudaMemcpy(output.data(), d_output, output_size, cudaMemcpyDeviceToHost));
+    
+    // Free device memory
+    CHECK_CUDA_ERROR(cudaFree(d_q));
+    CHECK_CUDA_ERROR(cudaFree(d_k));
+    CHECK_CUDA_ERROR(cudaFree(d_v));
+    CHECK_CUDA_ERROR(cudaFree(d_output));
+    CHECK_CUDA_ERROR(cudaFree(d_q_reshaped));
+    CHECK_CUDA_ERROR(cudaFree(d_k_reshaped));
+    CHECK_CUDA_ERROR(cudaFree(d_v_reshaped));
+    CHECK_CUDA_ERROR(cudaFree(d_attn_output_all));
+    
     return output;
 }

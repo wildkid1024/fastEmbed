@@ -19,6 +19,20 @@ public:
         size_t num_heads,                         // Number of attention heads
         size_t embedding_dim                      // Embedding dimension per token
     );
+    
+    // GQA (Grouped Query Attention) 支持不同的Q/K/V头数
+    // 输入格式: [seq_len, num_heads * head_dim] (与multi_head_attention保持一致)
+    std::vector<float> grouped_query_attention(
+        const std::vector<float>& q_input,       // [seq_len, num_q_heads * head_dim]
+        const std::vector<float>& k_input,       // [seq_len, num_kv_heads * head_dim]
+        const std::vector<float>& v_input,       // [seq_len, num_kv_heads * head_dim]
+        const std::vector<float>& q_norm_weight, // [head_dim], Q的RMS norm权重
+        const std::vector<float>& k_norm_weight, // [head_dim], K的RMS norm权重
+        size_t seq_len,
+        size_t num_q_heads,
+        size_t num_kv_heads,
+        size_t head_dim
+    );
 };
 
 #endif // CUDA_ATTENTION_OPS_CUH
