@@ -37,6 +37,17 @@ public:
     
     // 融合操作：SiLU激活 + 逐元素相乘 (用于MLP的gate * up)
     std::vector<float> silu_multiply(const std::vector<float>& gate_output, const std::vector<float>& up_output);
+    
+    // 完整MLP融合操作：gate_proj + up_proj + SiLU_multiply + down_proj
+    std::vector<float> mlp_fused(
+        const std::vector<float>& input,           // [seq_len, hidden_size]
+        const std::vector<float>& gate_weight,     // [hidden_size, intermediate_size]
+        const std::vector<float>& up_weight,       // [hidden_size, intermediate_size]
+        const std::vector<float>& down_weight,     // [intermediate_size, hidden_size]
+        size_t seq_len,
+        size_t hidden_size,
+        size_t intermediate_size
+    );
 
     // CUDA资源管理
     ~CUDAMatrixOps();

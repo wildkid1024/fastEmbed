@@ -623,3 +623,77 @@ std::vector<float> CUDAMatrixOps::silu_multiply(const std::vector<float>& gate_o
     
     return result;
 }
+
+// 完整MLP融合操作：gate_proj + up_proj + SiLU_multiply + down_proj
+std::vector<float> CUDAMatrixOps::mlp_fused(
+    const std::vector<float>& input,
+    const std::vector<float>& gate_weight,
+    const std::vector<float>& up_weight,
+    const std::vector<float>& down_weight,
+    size_t seq_len,
+    size_t hidden_size,
+    size_t intermediate_size
+) {
+    size_t input_size = seq_len * hidden_size;
+    size_t intermediate_total = seq_len * intermediate_size;
+    size_t output_size = seq_len * hidden_size;
+    
+    // 计算所需的最大显存
+    size_t max_size = std::max({input_size, gate_weight.size(), up_weight.size(), 
+                                down_weight.size(), intermediate_total, output_size});
+    
+    // 使用ensure_memory确保基础缓冲区足够大
+    ensure_memory(max_size);
+    
+    // 分配额外的中间结果缓冲区
+    float *d_gate_output, *d_up_output, *d_gate_up;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_gate_output, intermediate_total * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_up_output, intermediate_total * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_gate_up, intermediate_total * sizeof(float)));
+    
+    // 复制输入数据到GPU (复用d_a, d_b)
+    CHECK_CUDA_ERROR(cudaMemcpy(d_a, input.data(), input_size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_b, gate_weight.data(), gate_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // Step 1: gate_proj = input × gate_weight^T [seq_len, hidden_size] × [hidden_size, intermediate_size]^T
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (intermediate_size + blockDim.x - 1) / blockDim.x,
+        (seq_len + blockDim.y - 1) / blockDim.y
+    );
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_gate_output, seq_len, hidden_size, intermediate_size);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Step 2: up_proj = input × up_weight^T (复用d_b存储up_weight)
+    CHECK_CUDA_ERROR(cudaMemcpy(d_b, up_weight.data(), up_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_up_output, seq_len, hidden_size, intermediate_size);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Step 3: SiLU(gate_output) * up_output
+    int siluBlockSize = 256;
+    int siluGridSize = (intermediate_total + siluBlockSize - 1) / siluBlockSize;
+    silu_multiply_kernel<<<siluGridSize, siluBlockSize>>>(d_gate_output, d_up_output, d_gate_up, intermediate_total);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    
+    // Step 4: down_proj = gate_up × down_weight^T (复用d_b存储down_weight, d_result存储输出)
+    CHECK_CUDA_ERROR(cudaMemcpy(d_b, down_weight.data(), down_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
+    dim3 downBlockDim(16, 16);
+    dim3 downGridDim(
+        (hidden_size + downBlockDim.x - 1) / downBlockDim.x,
+        (seq_len + downBlockDim.y - 1) / downBlockDim.y
+    );
+    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_b, d_result, seq_len, intermediate_size, hidden_size);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    
+    // 复制结果回主机
+    std::vector<float> result(output_size);
+    CHECK_CUDA_ERROR(cudaMemcpy(result.data(), d_result, output_size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // 释放额外的GPU内存
+    CHECK_CUDA_ERROR(cudaFree(d_gate_output));
+    CHECK_CUDA_ERROR(cudaFree(d_up_output));
+    CHECK_CUDA_ERROR(cudaFree(d_gate_up));
+    
+    return result;
+}

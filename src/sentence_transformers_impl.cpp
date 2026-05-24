@@ -629,25 +629,11 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             // 从权重中获取intermediate_size
             size_t intermediate_size = gate_proj_weight.size() / hidden_size;
             
-            // 执行MLP前馈网络
-            // gate_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
-            std::vector<float> gate_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, gate_proj_weight, seq_len, hidden_size, intermediate_size
-                );
-            
-            // up_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
-            std::vector<float> up_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
-                );
-            
-            // 融合操作：SiLU(gate_output) * up_output (使用GPU融合kernel)
-            std::vector<float> gate_up_output = cuda_matrix_ops.silu_multiply(gate_output, up_output);
-            
-            
-            // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
-            std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    gate_up_output, down_proj_weight, seq_len, intermediate_size, hidden_size
-                );
+            // 执行完整的MLP前馈网络（GPU融合：gate_proj + up_proj + SiLU_multiply + down_proj）
+            std::vector<float> mlp_output = cuda_matrix_ops.mlp_fused(
+                embedded, gate_proj_weight, up_proj_weight, down_proj_weight,
+                seq_len, hidden_size, intermediate_size
+            );
             
             
             // 将MLP输出加到注意力残差后的值上（不是LN后的值）
