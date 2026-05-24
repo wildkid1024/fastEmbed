@@ -594,7 +594,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                         attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
                     );
                 
-                // 将注意力输出加到残差输入上（不是LN后的值）
+                // 将注意力输出加到残差输入上（CPU实现更高效）
                 for (size_t i = 0; i < embedded.size(); ++i) {
                     embedded[i] = residual[i] + projected_output[i];
                 }
@@ -641,10 +641,8 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 );
             
             
-            // 应用SiLU激活函数: x * sigmoid(x)
-            for (size_t i = 0; i < gate_output.size(); ++i) {
-                gate_output[i] = gate_output[i] * (1.0f / (1.0f + std::exp(-gate_output[i])));
-            }
+            // 应用SiLU激活函数: x * sigmoid(x) (使用GPU加速)
+            gate_output = cuda_matrix_ops.silu(gate_output);
             
             
             // 逐元素相乘

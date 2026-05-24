@@ -14,6 +14,7 @@ public:
     // 添加ReLU和Swish函数声明
     std::vector<float> relu(const std::vector<float>& input);
     std::vector<float> swish(const std::vector<float>& input);
+    std::vector<float> silu(const std::vector<float>& input);  // SiLU = Swish
     // 层归一化方法
     std::vector<float> layer_norm(const std::vector<float>& input,
                                   const std::vector<float>& gamma,
@@ -30,6 +31,9 @@ public:
 
     // New device-side softmax for attention scores
     void apply_softmax(float* input, size_t num_heads, size_t seq_len);
+    
+    // 向量相加（用于残差连接）
+    std::vector<float> vector_add(const std::vector<float>& a, const std::vector<float>& b);
 
     // CUDA资源管理
     ~CUDAMatrixOps();

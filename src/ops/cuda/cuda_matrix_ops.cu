@@ -285,6 +285,12 @@ std::vector<float> CUDAMatrixOps::swish(const std::vector<float>& input) {
     return output;
 }
 
+// SiLU激活函数 (SiLU = Swish = x * sigmoid(x))
+std::vector<float> CUDAMatrixOps::silu(const std::vector<float>& input) {
+    // SiLU和Swish是同一个函数，直接复用swish实现
+    return swish(input);
+}
+
 std::vector<float> CUDAMatrixOps::gelu(const std::vector<float>& input) {
     size_t size = input.size();
     ensure_memory(size);
@@ -517,4 +523,51 @@ std::vector<float> CUDAMatrixOps::rms_norm(
     CHECK_CUDA_ERROR(cudaFree(d_output));
 
     return output;
+}
+
+// 向量相加核函数（用于残差连接）
+__global__ void vector_add_kernel(const float* a, const float* b, float* result, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        result[idx] = a[idx] + b[idx];
+    }
+}
+
+// 向量相加方法（用于残差连接）
+std::vector<float> CUDAMatrixOps::vector_add(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) {
+        throw std::invalid_argument("Vector sizes must match for addition");
+    }
+    
+    size_t size = a.size();
+    std::vector<float> result(size);
+    
+    // 分配GPU内存
+    float *d_a, *d_b, *d_result;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_a, size * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_b, size * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_result, size * sizeof(float)));
+    
+    // 复制数据到GPU
+    CHECK_CUDA_ERROR(cudaMemcpy(d_a, a.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_b, b.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // 配置kernel参数
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    
+    // 执行向量相加
+    vector_add_kernel<<<gridSize, blockSize>>>(d_a, d_b, d_result, size);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    
+    // 复制结果回主机
+    CHECK_CUDA_ERROR(cudaMemcpy(result.data(), d_result, size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // 释放GPU内存
+    CHECK_CUDA_ERROR(cudaFree(d_a));
+    CHECK_CUDA_ERROR(cudaFree(d_b));
+    CHECK_CUDA_ERROR(cudaFree(d_result));
+    
+    return result;
 }
