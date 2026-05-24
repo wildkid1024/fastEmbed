@@ -687,7 +687,7 @@ std::vector<std::string> Qwen3Tokenizer::tokenize(const std::string& text) {
     // 步骤1: Pre-tokenization - 按正则表达式分割文本
     std::vector<std::string> pre_tokens = pre_tokenize(mapped_text);
     
-    static bool debug_enabled = true;
+    static bool debug_enabled = false;
     if (debug_enabled) {
         printf("DEBUG tokenize: text='%s', pre_tokens count=%zu\n", text.c_str(), pre_tokens.size());
         for (size_t i = 0; i < pre_tokens.size(); ++i) {

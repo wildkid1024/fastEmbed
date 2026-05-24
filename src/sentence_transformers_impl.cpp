@@ -9,6 +9,7 @@
 #include <iostream>
 #include <vector>  // 添加缺失的vector头文件
 #include <filesystem>  // 添加filesystem头文件以使用exists函数
+#include <chrono>  // 添加chrono头文件用于计时
 
 
 // 使用新的 tokenizer 进行分词
@@ -47,7 +48,7 @@ std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) 
 
 // 简单的嵌入层前向传播
 std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<int32_t>& tokens) {
-    printf("DEBUG: embedding_layer called with %zu tokens\n", tokens.size());
+    // printf("DEBUG: embedding_layer called with %zu tokens\n", tokens.size());
     // 调整输出向量大小为 tokens.size() * embedding_dim
     std::vector<float> output(tokens.size() * embedding_dim, 0.0f);
     
@@ -62,20 +63,20 @@ std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<in
     const std::vector<float>& embedding_weight = weights[embed_weight_key];
     
     // 调试输出：打印词嵌入权重的前几个值和token IDs
-    if (tokens.size() > 0) {
-        printf("DEBUG: embed_weight_key=%s, size=%zu\n", embed_weight_key.c_str(), embedding_weight.size());
-        printf("DEBUG: tokens[0]=%d, tokens[1]=%d\n", tokens[0], tokens.size() > 1 ? tokens[1] : -1);
+    // if (tokens.size() > 0) {
+    //     printf("DEBUG: embed_weight_key=%s, size=%zu\n", embed_weight_key.c_str(), embedding_weight.size());
+    //     printf("DEBUG: tokens[0]=%d, tokens[1]=%d\n", tokens[0], tokens.size() > 1 ? tokens[1] : -1);
         
-        // 打印第一个token对应的权重前5个值
-        if (tokens[0] >= 0 && static_cast<size_t>(tokens[0]) < embedding_weight.size() / embedding_dim) {
-            size_t start_idx = tokens[0] * embedding_dim;
-            printf("DEBUG: embed_weight[token0][:5] = [");
-            for (size_t j = 0; j < 5; ++j) {
-                printf("%.6f%s", embedding_weight[start_idx + j], j < 4 ? ", " : "");
-            }
-            printf("]\n");
-        }
-    }
+    //     // 打印第一个token对应的权重前5个值
+    //     if (tokens[0] >= 0 && static_cast<size_t>(tokens[0]) < embedding_weight.size() / embedding_dim) {
+    //         size_t start_idx = tokens[0] * embedding_dim;
+    //         printf("DEBUG: embed_weight[token0][:5] = [");
+    //         for (size_t j = 0; j < 5; ++j) {
+    //             printf("%.6f%s", embedding_weight[start_idx + j], j < 4 ? ", " : "");
+    //         }
+    //         printf("]\n");
+    //     }
+    // }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         int32_t token = tokens[i];
@@ -491,31 +492,15 @@ static void apply_rope(std::vector<float>& q_states, std::vector<float>& k_state
 
 // Qwen3模型的前向传播
 std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int32_t>& tokens) {
-    printf("DEBUG: qwen3_forward start, seq_len=%zu\n", tokens.size());
     // 获取词嵌入
     std::vector<float> embedded = embedding_layer(tokens);
     size_t seq_len = tokens.size();
     size_t hidden_size = embedding_dim;
     
-    // 调试输出：打印embedding_layer的输出
-    if (seq_len > 0) {
-        size_t last_tok = (seq_len - 1) * hidden_size;
-        printf("DEBUG: after embedding_layer[last][:5] = [");
-        for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
-            printf("%.6f%s", embedded[last_tok + j], j < 4 ? ", " : "");
-        }
-        printf("]\n");
-    }
-    
-    printf("DEBUG: after embedding, hidden_size=%zu\n", hidden_size);
-    
-    // 获取模型配置
     size_t num_layers = this->config["num_hidden_layers"];
     size_t num_attention_heads = this->config["num_attention_heads"];
     size_t num_key_value_heads = this->config.contains("num_key_value_heads") ? 
                                 this->config["num_key_value_heads"].get<size_t>() : num_attention_heads;
-    
-    printf("DEBUG: num_layers=%zu, num_attn_heads=%zu, num_kv_heads=%zu\n", num_layers, num_attention_heads, num_key_value_heads);
     
     // Qwen3使用GQA，Q的维度可能不同于hidden_size
     std::string q_proj_key_check = "layers.0.self_attn.q_proj.weight";
@@ -523,12 +508,9 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
     if (weights.find(q_proj_key_check) != weights.end()) {
         const auto& q_weight = weights[q_proj_key_check];
         q_output_dim = q_weight.size() / hidden_size;  // [q_output_dim, hidden_size]
-        printf("DEBUG: q_weight.size()=%zu, q_output_dim=%zu\n", q_weight.size(), q_output_dim);
     }
     size_t head_dim = q_output_dim / num_attention_heads;
     size_t kv_output_dim = num_key_value_heads * head_dim;
-    
-    printf("DEBUG: head_dim=%zu, kv_output_dim=%zu\n", head_dim, kv_output_dim);
     
     // 通过每一层Transformer
     for (size_t layer = 0; layer < num_layers; ++layer) {
@@ -541,53 +523,15 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
         std::string input_layernorm_weight_key = layer_prefix + "input_layernorm.weight";
         if (weights.find(input_layernorm_weight_key) != weights.end()) {
             const std::vector<float>& ln_weight = weights[input_layernorm_weight_key];
+            
+            // RMS归一化
             float eps = this->config.value("rms_norm_eps", 1e-6f);
             
-            // 调试输出：Layer 0的LN权重和输入
-            if (layer == 0) {
-                size_t last_embedded_before = (seq_len - 1) * hidden_size;
-                printf("DEBUG Layer 0 before Input LN[last][:5] = [");
-                for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
-                    printf("%.6f%s", embedded[last_embedded_before + j], j < 4 ? ", " : "");
-                }
-                printf("]\n");
-                
-                // 计算embedded的统计信息（仅最后一个token）
-                float sum_sq = 0.0f;
-                float min_val = embedded[last_embedded_before], max_val = embedded[last_embedded_before];
-                for (size_t j = 0; j < hidden_size; ++j) {
-                    float val = embedded[last_embedded_before + j];
-                    sum_sq += val * val;
-                    if (val < min_val) min_val = val;
-                    if (val > max_val) max_val = val;
-                }
-                float rms = std::sqrt(sum_sq / hidden_size);
-                printf("DEBUG Layer 0 last token stats: RMS=%.6f, min=%.6f, max=%.6f\n", rms, min_val, max_val);
-                
-                printf("DEBUG Layer 0 found input_layernorm.weight, size=%zu\n", ln_weight.size());
-                printf("DEBUG Layer 0 input_layernorm.weight[:5] = [");
-                for (size_t j = 0; j < 5 && j < ln_weight.size(); ++j) {
-                    printf("%.6f%s", ln_weight[j], j < 4 ? ", " : "");
-                }
-                printf("]\n");
-            }
             
             embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
-        } else {
-            if (layer == 0) {
-                printf("DEBUG Layer 0 ERROR: input_layernorm.weight NOT FOUND! Key: %s\n", input_layernorm_weight_key.c_str());
-            }
-        }
+        } 
 
-        // 调试输出：Layer 0 input LN后的值
-        if (layer == 0) {
-            size_t last_embedded = (seq_len - 1) * hidden_size;
-            printf("DEBUG Layer 0 after Input LN[last][:5] = [");
-            for (size_t j = 0; j < 5 && j < hidden_size; ++j) {
-                printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-            }
-            printf("]\n");
-        }
+        
         
         // 用于保存注意力残差后的值，供MLP残差使用
         std::vector<float> hidden_after_attn;
@@ -610,16 +554,7 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             const std::vector<float>& v_proj_weight = weights[v_proj_key];
             const std::vector<float>& o_proj_weight = weights[o_proj_key];
             
-            // 调试输出：打印权重形状和前几个值
-            if (layer == 0) {
-                printf("DEBUG Layer 0 q_proj_weight.size()=%zu (expected %zu)\n", q_proj_weight.size(), q_output_dim * hidden_size);
-                printf("DEBUG Layer 0 k_proj_weight.size()=%zu (expected %zu)\n", k_proj_weight.size(), kv_output_dim * hidden_size);
-                printf("DEBUG Layer 0 q_proj_weight[:5] = [");
-                for (size_t i = 0; i < 5 && i < q_proj_weight.size(); ++i) {
-                    printf("%.6f%s", q_proj_weight[i], i < 4 ? ", " : "");
-                }
-                printf("]\n");
-            }
+           
             
             // 获取Qwen3特有的查询和键归一化权重
             std::string q_norm_key = layer_prefix + "self_attn.q_norm.weight";
@@ -632,35 +567,20 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 // 执行Q、K、V投影（使用正确的维度）
                 // Q: [seq_len, hidden_size] x [hidden_size, q_output_dim]
                 std::vector<float> q_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, q_proj_weight, seq_len, hidden_size, q_output_dim
-                );
+                        embedded, q_proj_weight, seq_len, hidden_size, q_output_dim
+                    );
                 
                 // K/V: [seq_len, hidden_size] x [hidden_size, kv_output_dim]
                 std::vector<float> k_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, k_proj_weight, seq_len, hidden_size, kv_output_dim
-                );
+                        embedded, k_proj_weight, seq_len, hidden_size, kv_output_dim
+                    );
                 
                 std::vector<float> v_states = cuda_matrix_ops.matrix_multiply_transpose(
-                    embedded, v_proj_weight, seq_len, hidden_size, kv_output_dim
-                );
+                        embedded, v_proj_weight, seq_len, hidden_size, kv_output_dim
+                    );
                 
-                // 调试输出：打印embedded最后一个token的前5个值
-                if (layer == 0) {
-                    size_t last_embedded = (seq_len - 1) * hidden_size;
-                    printf("DEBUG Layer 0 embedded[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    
-                    printf("DEBUG Layer 0 Q[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_states[(seq_len - 1) * q_output_dim + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 K[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_states[(seq_len - 1) * kv_output_dim + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 V[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", v_states[(seq_len - 1) * kv_output_dim + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                }
+                
+               
                 
                 // Reshape Q/K/V为多头格式: [seq_len, num_heads, head_dim]
                 // 存储为 [seq_len * num_heads * head_dim]
@@ -668,8 +588,8 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 std::vector<float> k_reshaped(seq_len * num_key_value_heads * head_dim);
                 std::vector<float> v_reshaped(seq_len * num_key_value_heads * head_dim);
                 
-                printf("DEBUG: q_output_dim=%zu, kv_output_dim=%zu, head_dim=%zu\n", q_output_dim, kv_output_dim, head_dim);
-                printf("DEBUG: q_reshaped size=%zu, expected=%zu\n", q_reshaped.size(), seq_len * num_attention_heads * head_dim);
+                // printf("DEBUG: q_output_dim=%zu, kv_output_dim=%zu, head_dim=%zu\n", q_output_dim, kv_output_dim, head_dim);
+                // printf("DEBUG: q_reshaped size=%zu, expected=%zu\n", q_reshaped.size(), seq_len * num_attention_heads * head_dim);
                 
                 for (size_t i = 0; i < seq_len; ++i) {
                     for (size_t h = 0; h < num_attention_heads; ++h) {
@@ -729,40 +649,12 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                     }
                 }
                 
-                // 调试输出：q_norm后
-                if (layer == 0) {
-                    size_t last_q = (seq_len - 1) * num_attention_heads * head_dim;
-                    size_t last_k = (seq_len - 1) * num_key_value_heads * head_dim;
-                    printf("DEBUG Layer 0 after q_norm Q[head0][last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 after q_norm Q[head0][last][64:69] = [");
-                    for (size_t j = 64; j < 69; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 68 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 after k_norm K[head0][last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                }
                 
                 // 应用RoPE
                 apply_rope(q_reshaped, k_reshaped, seq_len, 
                           num_attention_heads * head_dim, num_attention_heads,
                           num_key_value_heads * head_dim, num_key_value_heads);
                 
-                // 调试输出：RoPE后
-                if (layer == 0) {
-                    size_t last_q = (seq_len - 1) * num_attention_heads * head_dim;
-                    size_t last_k = (seq_len - 1) * num_key_value_heads * head_dim;
-                    printf("DEBUG Layer 0 after RoPE Q[head0][last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 after RoPE Q[head0][last][64:69] = [");
-                    for (size_t j = 64; j < 69; ++j) printf("%.6f%s", q_reshaped[last_q + j], j < 68 ? ", " : "");
-                    printf("]\n");
-                    printf("DEBUG Layer 0 after RoPE K[head0][last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", k_reshaped[last_k + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                }
                 
                 // GQA注意力计算
                 std::vector<float> attn_output(seq_len * q_output_dim, 0.0f);
@@ -844,8 +736,8 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                             float val = 0.0f;
                             for (size_t j = 0; j < seq_len; ++j) {
                                 val += scores[i * seq_len + j] * v_head[j * head_dim + d];
-                            }
-                            attn_head[i * head_dim + d] = val;
+                                }
+                                attn_head[i * head_dim + d] = val;
                         }
                     }
                     
@@ -862,35 +754,8 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 
                 // 应用输出投影 O: [seq_len, q_output_dim] × [hidden_size, q_output_dim]^T
                 std::vector<float> projected_output = cuda_matrix_ops.matrix_multiply_transpose(
-                    attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
-                );
-                
-                // 调试输出：打印Layer 0的attn_output和projected_output
-                if (layer == 0) {
-                    printf("DEBUG Layer 0 attn_output stats: min=%.6f, max=%.6f, mean=%.6f\n",
-                           *std::min_element(attn_output.begin(), attn_output.end()),
-                           *std::max_element(attn_output.begin(), attn_output.end()),
-                           std::accumulate(attn_output.begin(), attn_output.end(), 0.0f) / attn_output.size());
-                    
-                    printf("DEBUG Layer 0 attn_output[first][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", attn_output[j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    
-                    size_t last_attn = (seq_len - 1) * q_output_dim;
-                    printf("DEBUG Layer 0 attn_output[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", attn_output[last_attn + j], j < 4 ? ", " : "");
-                    printf("]\n");
-
-                    // projected_output[first][:5]
-                    printf("DEBUG Layer %zu projected_output[first][:5] = [", layer);
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", projected_output[j], j < 4 ? ", " : "");
-                    printf("]\n");
-                    
-                    size_t last_proj = (seq_len - 1) * hidden_size;
-                    printf("DEBUG Layer 0 projected_output[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", projected_output[last_proj + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                }
+                        attn_output, o_proj_weight, seq_len, q_output_dim, hidden_size
+                    );
                 
                 // 将注意力输出加到残差输入上（不是LN后的值）
                 for (size_t i = 0; i < embedded.size(); ++i) {
@@ -899,14 +764,6 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
                 
                 // 保存注意力残差后的值，用于MLP残差连接
                 hidden_after_attn = embedded;
-                
-                // 调试输出：残差连接后的值
-                if (layer == 0) {
-                    size_t last_embedded = (seq_len - 1) * hidden_size;
-                    printf("DEBUG Layer 0 After residual[last][:5] = [");
-                    for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-                    printf("]\n");
-                }
             }
         }
         
@@ -917,23 +774,15 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             float eps = this->config.value("rms_norm_eps", 1e-6f);
             
             embedded = cuda_matrix_ops.rms_norm(embedded, ln_weight, hidden_size, eps);
-            
-            // 调试输出：post-attention LN后的值
-            if (layer == 0) {
-                size_t last_embedded = (seq_len - 1) * hidden_size;
-                printf("DEBUG Layer 0 After post-attn LN[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
         }
-        
+            
         // 4. MLP层（在post-attention LN之后）
         std::string gate_proj_key = layer_prefix + "mlp.gate_proj.weight";
         std::string up_proj_key = layer_prefix + "mlp.up_proj.weight";
         std::string down_proj_key = layer_prefix + "mlp.down_proj.weight";
         
-        if (weights.find(gate_proj_key) != weights.end() && 
-            weights.find(up_proj_key) != weights.end() && 
+        if (weights.find(gate_proj_key) != weights.end() &&
+            weights.find(up_proj_key) != weights.end() &&
             weights.find(down_proj_key) != weights.end()) {
             
             const std::vector<float>& gate_proj_weight = weights[gate_proj_key];
@@ -946,97 +795,37 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
             // 执行MLP前馈网络
             // gate_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
             std::vector<float> gate_output = cuda_matrix_ops.matrix_multiply_transpose(
-                embedded, gate_proj_weight, seq_len, hidden_size, intermediate_size
-            );
+                    embedded, gate_proj_weight, seq_len, hidden_size, intermediate_size
+                );
             
             // up_proj: [seq_len, hidden_size] × [hidden_size, intermediate_size]
             std::vector<float> up_output = cuda_matrix_ops.matrix_multiply_transpose(
-                embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
-            );
+                    embedded, up_proj_weight, seq_len, hidden_size, intermediate_size
+                );
             
-            // 调试输出：Gate和Up投影后的值
-            if (layer == 0) {
-                size_t last_gate = (seq_len - 1) * intermediate_size;
-                printf("DEBUG Layer 0 Gate output[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_gate + j], j < 4 ? ", " : "");
-                printf("]\n");
-                
-                printf("DEBUG Layer 0 Up output[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", up_output[last_gate + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
             
             // 应用SiLU激活函数: x * sigmoid(x)
             for (size_t i = 0; i < gate_output.size(); ++i) {
                 gate_output[i] = gate_output[i] * (1.0f / (1.0f + std::exp(-gate_output[i])));
             }
             
-            // 调试输出：SiLU激活后的值
-            if (layer == 0) {
-                size_t last_gate = (seq_len - 1) * intermediate_size;
-                printf("DEBUG Layer 0 Gate after SiLU[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_gate + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
             
             // 逐元素相乘
             for (size_t i = 0; i < gate_output.size(); ++i) {
                 gate_output[i] *= up_output[i];
             }
             
-            // 调试输出：gate*up后的值
-            if (layer == 0) {
-                size_t last_intermediate = (seq_len - 1) * intermediate_size;
-                printf("DEBUG Layer 0 After gate*up[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", gate_output[last_intermediate + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
             
             // down_proj: [seq_len, intermediate_size] × [intermediate_size, hidden_size]
             std::vector<float> mlp_output = cuda_matrix_ops.matrix_multiply_transpose(
-                gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
-            );
+                    gate_output, down_proj_weight, seq_len, intermediate_size, hidden_size
+                );
             
-            // 调试输出：down_proj权重形状和前几个值
-            if (layer == 0) {
-                printf("DEBUG Layer 0 down_proj_weight.size()=%zu (expected %zu)\n", 
-                       down_proj_weight.size(), intermediate_size * hidden_size);
-                printf("DEBUG Layer 0 down_proj_weight[:5] = [");
-                for (size_t i = 0; i < 5 && i < down_proj_weight.size(); ++i) {
-                    printf("%.6f%s", down_proj_weight[i], i < 4 ? ", " : "");
-                }
-                printf("]\n");
-            }
-            
-            // 调试输出：MLP输出
-            if (layer == 0) {
-                size_t last_mlp = (seq_len - 1) * hidden_size;
-                printf("DEBUG Layer 0 MLP output[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", mlp_output[last_mlp + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
             
             // 将MLP输出加到注意力残差后的值上（不是LN后的值）
             for (size_t i = 0; i < embedded.size(); ++i) {
                 embedded[i] = hidden_after_attn[i] + mlp_output[i];
             }
-            
-            // 调试输出：MLP残差连接后
-            if (layer == 0) {
-                size_t last_embedded = (seq_len - 1) * hidden_size;
-                printf("DEBUG Layer 0 After MLP residual[last][:5] = [");
-                for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-                printf("]\n");
-            }
-        }
-        
-        // 调试输出：每层结束后的值（作为下一层的输入）
-        if (layer == 0 || layer == 1) {
-            size_t last_embedded = (seq_len - 1) * hidden_size;
-            printf("DEBUG Layer %zu output (Layer %zu input)[last][:5] = [",
-                   layer, layer + 1);
-            for (size_t j = 0; j < 5; ++j) printf("%.6f%s", embedded[last_embedded + j], j < 4 ? ", " : "");
-            printf("]\n");
         }
     }
     
@@ -1058,13 +847,17 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
     float norm = 0.0f;
     for (float val : pooled_output) {
         norm += val * val;
-    }
+            }
     norm = std::sqrt(norm);
     if (norm > 0.0f) {
         for (float& val : pooled_output) {
             val /= norm;
+            }
         }
-    }
+        
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    // printf("[C++ Inference Time] %lld ms\n", static_cast<long long>(duration.count()));
     
     return pooled_output;
 }

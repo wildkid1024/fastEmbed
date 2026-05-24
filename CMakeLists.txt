@@ -42,7 +42,7 @@ if(USE_CUDA)
     # cmake_policy(SET CMP0146 NEW)
 
     # 设置 CUDA 架构
-    set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 89 90)
+    set(CMAKE_CUDA_ARCHITECTURES native)
 
     # Find CUDA Toolkit (modern CMake)
     find_package(CUDAToolkit REQUIRED)
