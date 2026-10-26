@@ -34,6 +34,7 @@ public:
     
     // 向量相加（用于残差连接）
     std::vector<float> vector_add(const std::vector<float>& a, const std::vector<float>& b);
+    std::vector<float> vector_add_batch(const std::vector<float>& a, const std::vector<float>& b);
     
     // 融合操作：SiLU激活 + 逐元素相乘 (用于MLP的gate * up)
     std::vector<float> silu_multiply(const std::vector<float>& gate_output, const std::vector<float>& up_output);
@@ -47,6 +48,40 @@ public:
         size_t seq_len,
         size_t hidden_size,
         size_t intermediate_size
+    );
+
+    // 完整MLP融合操作（GELU-tanh 门控）：gate_proj + up_proj + gelu_tanh(gate)*up + down_proj
+    // Gemma 系列的 hidden_activation 为 gelu_pytorch_tanh
+    std::vector<float> mlp_fused_gelu(
+        const std::vector<float>& input,           // [seq_len, hidden_size]
+        const std::vector<float>& gate_weight,     // [intermediate_size, hidden_size]
+        const std::vector<float>& up_weight,       // [intermediate_size, hidden_size]
+        const std::vector<float>& down_weight,     // [hidden_size, intermediate_size]
+        size_t seq_len,
+        size_t hidden_size,
+        size_t intermediate_size
+    );
+    
+    // ========== 批量版本 ==========
+    std::vector<float> matrix_multiply_transpose_batch(
+        const std::vector<float>& a, const std::vector<float>& b,
+        size_t batch_size, size_t m, size_t n, size_t k
+    );
+    
+    std::vector<float> rms_norm_batch(
+        const std::vector<float>& input,
+        const std::vector<float>& weight,
+        size_t batch_size, size_t seq_len, size_t hidden_size,
+        float epsilon
+    );
+    
+    std::vector<float> mlp_fused_batch(
+        const std::vector<float>& input,
+        const std::vector<float>& gate_weight,
+        const std::vector<float>& up_weight,
+        const std::vector<float>& down_weight,
+        size_t batch_size, size_t seq_len,
+        size_t hidden_size, size_t intermediate_size
     );
 
     // CUDA资源管理

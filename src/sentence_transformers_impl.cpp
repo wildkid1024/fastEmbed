@@ -10,12 +10,17 @@
 #include <vector>  // 添加缺失的vector头文件
 #include <filesystem>  // 添加filesystem头文件以使用exists函数
 #include <chrono>  // 添加chrono头文件用于计时
+#include <algorithm>  // std::sort
 
 
 // 使用新的 tokenizer 进行分词
 std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) {
     std::vector<int> token_ids;
-    if (model_type == ModelType::BGE_M3 && xlmr_tokenizer) {
+    if (model_type == ModelType::EMBEDDING_GEMMA2 && gemma_tokenizer) {
+        // Gemma 使用 SentencePiece，句首添加 <bos>
+        auto ids = gemma_tokenizer->encode_text(text);
+        token_ids.assign(ids.begin(), ids.end());
+    } else if (model_type == ModelType::BGE_M3 && xlmr_tokenizer) {
         // 使用XLMRobertaTokenizer进行分词
         auto tokens = xlmr_tokenizer->tokenize(text);
         token_ids = xlmr_tokenizer->encode(tokens);
@@ -46,6 +51,16 @@ std::vector<int32_t> SentenceTransformerImpl::tokenize(const std::string& text) 
     return std::vector<int32_t>(token_ids.begin(), token_ids.end());
 }
 
+// 批量分词
+std::vector<std::vector<int32_t>> SentenceTransformerImpl::tokenize_batch(const std::vector<std::string>& texts) {
+    std::vector<std::vector<int32_t>> tokens_list;
+    tokens_list.reserve(texts.size());
+    for (const auto& text : texts) {
+        tokens_list.push_back(tokenize(text));
+    }
+    return tokens_list;
+}
+
 // 简单的嵌入层前向传播
 std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<int32_t>& tokens) {
     // printf("DEBUG: embedding_layer called with %zu tokens\n", tokens.size());
@@ -56,6 +71,9 @@ std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<in
     std::string embed_weight_key;
     if (model_type == ModelType::QWEN3) {
         embed_weight_key = "embed_tokens.weight";
+    } else if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        // EmbeddingGemma2 的文本塔权重使用 language_model. 前缀
+        embed_weight_key = "language_model.embed_tokens.weight";
     } else {
         embed_weight_key = "embeddings.word_embeddings.weight";
     }
@@ -93,6 +111,62 @@ std::vector<float> SentenceTransformerImpl::embedding_layer(const std::vector<in
     return output;
 }
 
+// 批量嵌入层前向传播
+std::vector<float> SentenceTransformerImpl::embedding_layer_batch(const std::vector<std::vector<int32_t>>& tokens_list) {
+    // 找到所有序列的最大长度
+    size_t max_seq_len = 0;
+    size_t batch_size = tokens_list.size();
+    for (const auto& tokens : tokens_list) {
+        if (tokens.size() > max_seq_len) {
+            max_seq_len = tokens.size();
+        }
+    }
+    
+    // 创建填充后的批量tokens
+    std::vector<int32_t> padded_tokens(batch_size * max_seq_len, 0);
+    std::vector<size_t> seq_lens(batch_size);
+    
+    for (size_t b = 0; b < batch_size; ++b) {
+        const auto& tokens = tokens_list[b];
+        seq_lens[b] = tokens.size();
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            padded_tokens[b * max_seq_len + t] = tokens[t];
+        }
+    }
+    
+    // 根据模型类型选择正确的词嵌入权重键名
+    std::string embed_weight_key;
+    if (model_type == ModelType::QWEN3) {
+        embed_weight_key = "embed_tokens.weight";
+    } else if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        embed_weight_key = "language_model.embed_tokens.weight";
+    } else {
+        embed_weight_key = "embeddings.word_embeddings.weight";
+    }
+    
+    const std::vector<float>& embedding_weight = weights[embed_weight_key];
+    
+    // 批量嵌入输出
+    std::vector<float> output(batch_size * max_seq_len * embedding_dim, 0.0f);
+    
+    for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t t = 0; t < max_seq_len; ++t) {
+            int32_t token = padded_tokens[b * max_seq_len + t];
+            if (token < 0 || static_cast<size_t>(token) >= embedding_weight.size() / embedding_dim) {
+                // Token超出范围，保持0
+                continue;
+            }
+            size_t weight_start = token * embedding_dim;
+            size_t output_start = b * max_seq_len * embedding_dim + t * embedding_dim;
+            for (size_t j = 0; j < embedding_dim; ++j) {
+                output[output_start + j] = embedding_weight[weight_start + j];
+            }
+        }
+    }
+    
+    return output;
+}
+
 SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path) {
     std::string config_path = model_path + "/config.json";
     
@@ -103,10 +177,18 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
     }
     config_file >> this->config;
     
+    // 文本塔配置：多模态模型（如 EmbeddingGemma 2）把语言模型配置放在 text_config 下
+    this->text_config = this->config;
+    if (this->config.contains("text_config") && this->config["text_config"].is_object()) {
+        this->text_config = this->config["text_config"];
+    }
+    
     // 从config.json中读取model_type并设置模型类型
     std::string model_type_str = "bge";
     if (this->config.contains("model_type")) {
         model_type_str = this->config["model_type"];
+    } else if (this->text_config.contains("model_type")) {
+        model_type_str = this->text_config["model_type"];
     } else if (this->config.contains("model")) {
         model_type_str = this->config["model"]["model_type"];
     }
@@ -118,6 +200,9 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
         this->model_type = ModelType::BGE_M3;
     } else if (model_type_str == "qwen2" || model_type_str == "qwen3") {  // 添加Qwen2/Qwen3模型类型检测
         this->model_type = ModelType::QWEN3;
+    } else if (model_type_str.find("gemma") != std::string::npos) {
+        // embedding_gemma2 / embedding_gemma2_text / gemma3_text / gemma2 ...
+        this->model_type = ModelType::EMBEDDING_GEMMA2;
     } else {
         std::cerr << "警告: 未知的模型类型 '" << model_type_str << "'，默认使用BGE_M3" << std::endl;
         this->model_type = ModelType::BGE_M3;
@@ -146,30 +231,97 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
         }
         // 如果存在vocab.json，使用Hugging Face格式构造函数
         qwen3_tokenizer = std::make_unique<Qwen3Tokenizer>(tokenizer_json_path, vocab_json_path);
+    } else if (this->model_type == ModelType::EMBEDDING_GEMMA2) {
+        // Gemma / EmbeddingGemma 使用 SentencePiece（tokenizer.model）
+        std::string sentencepiece_model_path = tokenizer_path + "/tokenizer.model";
+        if (!std::filesystem::exists(sentencepiece_model_path)) {
+            throw std::runtime_error("无法找到 Gemma 的 SentencePiece 模型: " + sentencepiece_model_path);
+        }
+        std::string tokenizer_config_path = tokenizer_path + "/tokenizer_config.json";
+        gemma_tokenizer = std::make_unique<GemmaTokenizer>(
+            sentencepiece_model_path,
+            std::filesystem::exists(tokenizer_config_path) ? tokenizer_config_path : ""
+        );
     } else {
         // 传统BGE模型使用BGETokenizer
         bge_tokenizer = std::make_unique<BGETokenizer>(tokenizer_path + "/vocab.txt");
         std::string tokenizer_config_path = tokenizer_path + "/tokenizer.json";
     }
     
+    // 加载模型内置的提示词（config_sentence_transformers.json 中的 prompts 字段）
+    {
+        std::string st_config_path = model_path + "/config_sentence_transformers.json";
+        if (std::filesystem::exists(st_config_path)) {
+            std::ifstream st_file(st_config_path);
+            if (st_file.is_open()) {
+                try {
+                    nlohmann::json st_config;
+                    st_file >> st_config;
+                    if (st_config.contains("prompts") && st_config["prompts"].is_object()) {
+                        for (auto it = st_config["prompts"].begin(); it != st_config["prompts"].end(); ++it) {
+                            if (it.value().is_string()) {
+                                prompts[it.key()] = it.value().get<std::string>();
+                            }
+                        }
+                        std::cout << "已加载 " << prompts.size() << " 个内置提示词" << std::endl;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "解析 config_sentence_transformers.json 失败: " << e.what() << std::endl;
+                }
+            }
+        }
+    }
+    
     std::string tensor_path = model_path + "/model.safetensors";
-    if (!load_single_safetensors_file(tensor_path, weights)) {
+    // 多模态模型只保留文本塔，跳过视觉/音频塔（可省下约 0.9GB 权重）
+    std::vector<std::string> skip_prefixes;
+    if (this->model_type == ModelType::EMBEDDING_GEMMA2) {
+        skip_prefixes = {"vision_tower.", "audio_tower.", "embed_vision.", "embed_audio."};
+    }
+    if (!load_single_safetensors_file(tensor_path, weights, skip_prefixes)) {
         throw std::runtime_error("加载模型权重失败");
     }
     
     // 设置嵌入维度
-    const int vocab_size = this->config["vocab_size"];
+    const size_t vocab_size = this->text_config.contains("vocab_size")
+        ? this->text_config["vocab_size"].get<size_t>()
+        : this->config["vocab_size"].get<size_t>();
     
     // 根据模型类型查找嵌入层权重
     std::string embedding_weight_name = "embeddings.word_embeddings.weight";
     if (model_type == ModelType::QWEN3) {
         // Qwen3模型使用不同的嵌入层权重名称
         embedding_weight_name = "embed_tokens.weight";
-    } else if (weights.find(embedding_weight_name) == weights.end()) {
-        throw std::runtime_error("未找到嵌入层权重");
+    } else if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        // EmbeddingGemma2 的文本塔权重统一使用 language_model. 前缀
+        embedding_weight_name = "language_model.embed_tokens.weight";
+    }
+    if (weights.find(embedding_weight_name) == weights.end()) {
+        throw std::runtime_error("未找到嵌入层权重: " + embedding_weight_name);
     }
 
     embedding_dim = weights[embedding_weight_name].size() / vocab_size;
+    embedding_output_dim = embedding_dim;
+    
+    if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        // EmbeddingGemma2 在最后一层后接一个线性投影，把 hidden_size 映射到 embedding_dim
+        auto proj_it = weights.find("language_model.embedding_projection.weight");
+        if (proj_it != weights.end() && embedding_dim > 0) {
+            embedding_output_dim = proj_it->second.size() / embedding_dim;
+        }
+        
+        // 逐层注意力类型（决定 RoPE base 与是否使用滑动窗口）
+        if (this->text_config.contains("layer_types") && this->text_config["layer_types"].is_array()) {
+            for (const auto& item : this->text_config["layer_types"]) {
+                layer_types.push_back(item.get<std::string>());
+            }
+        }
+        std::cout << "EmbeddingGemma2: hidden_size=" << embedding_dim
+                  << ", embedding_dim=" << embedding_output_dim
+                  << ", layers=" << this->text_config.value("num_hidden_layers", 0)
+                  << ", heads=" << this->text_config.value("num_attention_heads", 0)
+                  << std::endl;
+    }
 }
 
 
@@ -676,9 +828,454 @@ std::vector<float> SentenceTransformerImpl::qwen3_forward(const std::vector<int3
     return pooled_output;
 }
 
-std::vector<float> SentenceTransformerImpl::encode(const std::string& text) {
-    // 分词
-    std::vector<int32_t> tokens = tokenize(text);
+// Qwen3 批量前向传播 - 使用真正的批量 CUDA 操作
+std::vector<std::vector<float>> SentenceTransformerImpl::qwen3_forward_batch(const std::vector<std::vector<int32_t>>& tokens_list) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+    
+    size_t batch_size = tokens_list.size();
+    if (batch_size == 0) {
+        return {};
+    }
+    
+    // 找到最大序列长度
+    size_t max_seq_len = 0;
+    for (const auto& tokens : tokens_list) {
+        if (tokens.size() > max_seq_len) {
+            max_seq_len = tokens.size();
+        }
+    }
+    
+    size_t hidden_size = embedding_dim;
+    size_t num_layers = this->config["num_hidden_layers"];
+    size_t num_attention_heads = this->config["num_attention_heads"];
+    size_t num_key_value_heads = this->config.contains("num_key_value_heads") ? 
+                                this->config["num_key_value_heads"].get<size_t>() : num_attention_heads;
+    
+    // Qwen3使用GQA，Q的维度可能不同于hidden_size
+    std::string q_proj_key_check = "layers.0.self_attn.q_proj.weight";
+    size_t q_output_dim = hidden_size;  // 默认值
+    if (weights.find(q_proj_key_check) != weights.end()) {
+        const auto& q_weight = weights[q_proj_key_check];
+        q_output_dim = q_weight.size() / hidden_size;  // [q_output_dim, hidden_size]
+    }
+    size_t head_dim = q_output_dim / num_attention_heads;
+    size_t kv_output_dim = num_key_value_heads * head_dim;
+    
+    // 获取批量嵌入
+    auto inference_start = std::chrono::high_resolution_clock::now();
+    std::vector<float> embedded = embedding_layer_batch(tokens_list);
+    
+    // 通过每一层Transformer
+    for (size_t layer = 0; layer < num_layers; ++layer) {
+        std::string layer_prefix = "layers." + std::to_string(layer) + ".";
+        
+        // 保存残差连接的输入
+        std::vector<float> residual = embedded;
+        
+        // 1. 输入层RMS归一化（Pre-Norm架构）
+        std::string input_layernorm_weight_key = layer_prefix + "input_layernorm.weight";
+        if (weights.find(input_layernorm_weight_key) != weights.end()) {
+            const std::vector<float>& ln_weight = weights[input_layernorm_weight_key];
+            float eps = this->config.value("rms_norm_eps", 1e-6f);
+            embedded = cuda_matrix_ops.rms_norm_batch(embedded, ln_weight, batch_size, max_seq_len, hidden_size, eps);
+        }
+        
+        // 用于保存注意力残差后的值，供MLP残差使用
+        std::vector<float> hidden_after_attn;
+        
+        // 2. 自注意力机制 - 这里我们对每个样本单独处理，但可以优化
+        std::string q_proj_key = layer_prefix + "self_attn.q_proj.weight";
+        std::string k_proj_key = layer_prefix + "self_attn.k_proj.weight";
+        std::string v_proj_key = layer_prefix + "self_attn.v_proj.weight";
+        std::string o_proj_key = layer_prefix + "self_attn.o_proj.weight";
+        
+        if (weights.find(q_proj_key) != weights.end() && 
+            weights.find(k_proj_key) != weights.end() && 
+            weights.find(v_proj_key) != weights.end() && 
+            weights.find(o_proj_key) != weights.end()) {
+            
+            const std::vector<float>& q_proj_weight = weights[q_proj_key];
+            const std::vector<float>& k_proj_weight = weights[k_proj_key];
+            const std::vector<float>& v_proj_weight = weights[v_proj_key];
+            const std::vector<float>& o_proj_weight = weights[o_proj_key];
+            
+            std::string q_norm_key = layer_prefix + "self_attn.q_norm.weight";
+            std::string k_norm_key = layer_prefix + "self_attn.k_norm.weight";
+            
+            if (weights.find(q_norm_key) != weights.end() && weights.find(k_norm_key) != weights.end()) {
+                const std::vector<float>& q_norm_weight = weights[q_norm_key];
+                const std::vector<float>& k_norm_weight = weights[k_norm_key];
+                
+                // 批量投影 Q, K, V
+                std::vector<float> q_states_batch = cuda_matrix_ops.matrix_multiply_transpose_batch(
+                    embedded, q_proj_weight, batch_size, max_seq_len, hidden_size, q_output_dim
+                );
+                
+                std::vector<float> k_states_batch = cuda_matrix_ops.matrix_multiply_transpose_batch(
+                    embedded, k_proj_weight, batch_size, max_seq_len, hidden_size, kv_output_dim
+                );
+                
+                std::vector<float> v_states_batch = cuda_matrix_ops.matrix_multiply_transpose_batch(
+                    embedded, v_proj_weight, batch_size, max_seq_len, hidden_size, kv_output_dim
+                );
+                
+                // 对每个样本单独处理注意力
+                std::vector<float> attn_output_batch(batch_size * max_seq_len * hidden_size, 0.0f);
+                for (size_t b = 0; b < batch_size; ++b) {
+                    size_t seq_len = tokens_list[b].size();
+                    
+                    // 提取单个样本的 Q, K, V
+                    std::vector<float> q_single(q_output_dim * seq_len);
+                    std::vector<float> k_single(kv_output_dim * seq_len);
+                    std::vector<float> v_single(kv_output_dim * seq_len);
+                    
+                    for (size_t t = 0; t < seq_len; ++t) {
+                        for (size_t d = 0; d < q_output_dim; ++d) {
+                            q_single[t * q_output_dim + d] = q_states_batch[(b * max_seq_len + t) * q_output_dim + d];
+                        }
+                        for (size_t d = 0; d < kv_output_dim; ++d) {
+                            k_single[t * kv_output_dim + d] = k_states_batch[(b * max_seq_len + t) * kv_output_dim + d];
+                            v_single[t * kv_output_dim + d] = v_states_batch[(b * max_seq_len + t) * kv_output_dim + d];
+                        }
+                    }
+                    
+                    // 计算单个样本的注意力
+                    std::vector<float> attn_single = cuda_attention_ops.grouped_query_attention(
+                        q_single, k_single, v_single, q_norm_weight, k_norm_weight,
+                        seq_len, num_attention_heads, num_key_value_heads, head_dim
+                    );
+                    
+                    // 投影输出
+                    std::vector<float> projected_single = cuda_matrix_ops.matrix_multiply_transpose(
+                        attn_single, o_proj_weight, seq_len, q_output_dim, hidden_size
+                    );
+                    
+                    // 残差连接 - 只对有效部分
+                    for (size_t t = 0; t < seq_len; ++t) {
+                        for (size_t d = 0; d < hidden_size; ++d) {
+                            size_t output_idx = (b * max_seq_len + t) * hidden_size + d;
+                            attn_output_batch[output_idx] = residual[(b * max_seq_len + t) * hidden_size + d] + projected_single[t * hidden_size + d];
+                        }
+                    }
+                }
+                
+                embedded = std::move(attn_output_batch);
+                hidden_after_attn = embedded;
+            }
+        }
+        
+        // 3. 后注意力层RMS归一化（在MLP之前应用）
+        std::string post_attn_layernorm_key = layer_prefix + "post_attention_layernorm.weight";
+        if (weights.find(post_attn_layernorm_key) != weights.end()) {
+            const std::vector<float>& ln_weight = weights[post_attn_layernorm_key];
+            float eps = this->config.value("rms_norm_eps", 1e-6f);
+            embedded = cuda_matrix_ops.rms_norm_batch(embedded, ln_weight, batch_size, max_seq_len, hidden_size, eps);
+        }
+        
+        // 4. MLP层（在post-attention LN之后）
+        std::string gate_proj_key = layer_prefix + "mlp.gate_proj.weight";
+        std::string up_proj_key = layer_prefix + "mlp.up_proj.weight";
+        std::string down_proj_key = layer_prefix + "mlp.down_proj.weight";
+        
+        if (weights.find(gate_proj_key) != weights.end() &&
+            weights.find(up_proj_key) != weights.end() &&
+            weights.find(down_proj_key) != weights.end()) {
+            
+            const std::vector<float>& gate_proj_weight = weights[gate_proj_key];
+            const std::vector<float>& up_proj_weight = weights[up_proj_key];
+            const std::vector<float>& down_proj_weight = weights[down_proj_key];
+            
+            size_t intermediate_size = gate_proj_weight.size() / hidden_size;
+            
+            // 执行批量MLP
+            std::vector<float> mlp_output = cuda_matrix_ops.mlp_fused_batch(
+                embedded, gate_proj_weight, up_proj_weight, down_proj_weight,
+                batch_size, max_seq_len, hidden_size, intermediate_size
+            );
+            
+            // 残差连接
+            embedded = cuda_matrix_ops.vector_add_batch(hidden_after_attn, mlp_output);
+        }
+    }
+    
+    // 最后的RMS层归一化
+    if (weights.find("norm.weight") != weights.end()) {
+        const std::vector<float>& final_norm_weight = weights["norm.weight"];
+        float eps = this->config.value("rms_norm_eps", 1e-6f);
+        embedded = cuda_matrix_ops.rms_norm_batch(embedded, final_norm_weight, batch_size, max_seq_len, hidden_size, eps);
+    }
+    
+    // 提取每个样本的最后一个token并归一化
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(batch_size);
+    
+    for (size_t b = 0; b < batch_size; ++b) {
+        size_t seq_len = tokens_list[b].size();
+        std::vector<float> pooled_output(hidden_size);
+        
+        // 取最后一个token的隐藏状态
+        for (size_t j = 0; j < hidden_size; ++j) {
+            pooled_output[j] = embedded[(b * max_seq_len + seq_len - 1) * hidden_size + j];
+        }
+        
+        // 归一化
+        float norm = 0.0f;
+        for (float val : pooled_output) {
+            norm += val * val;
+        }
+        norm = std::sqrt(norm);
+        if (norm > 0.0f) {
+            for (float& val : pooled_output) {
+                val /= norm;
+            }
+        }
+        
+        embeddings.push_back(std::move(pooled_output));
+    }
+    
+    auto inference_end = std::chrono::high_resolution_clock::now();
+    auto total_end = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(total_end - total_start);
+    auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_end - inference_start);
+    
+    printf("[Qwen3 Batch] Total: %lld ms | Inference: %lld ms | Batch size: %zu\n",
+           static_cast<long long>(total_duration.count()),
+           static_cast<long long>(inference_duration.count()),
+           batch_size);
+    
+    return embeddings;
+}
+
+// ================== EmbeddingGemma 2 前向传播 ==================
+// 参考实现: transformers/models/embedding_gemma2/modeling_embedding_gemma2.py
+// 结构要点：
+//   1. 词嵌入乘 sqrt(hidden_size)
+//   2. 全局 PLE 投影 -> 每层一份 per-layer 输入（RMSNorm）
+//   3. 每层: Pre-Norm 双向注意力 -> Pre-Norm MLP(gelu_pytorch_tanh) -> PLE block -> layer_scalar
+//   4. 最终 RMSNorm -> embedding_projection -> 均值池化 -> L2 归一化
+namespace {
+inline float gelu_tanh_scalar(float x) {
+    constexpr float kAlpha = 0.7978845608028654f;  // sqrt(2/pi)
+    constexpr float kBeta = 0.044715f;
+    return 0.5f * x * (1.0f + std::tanh(kAlpha * (x + kBeta * x * x * x)));
+}
+}  // namespace
+
+std::vector<float> SentenceTransformerImpl::embeddinggemma2_forward(const std::vector<int32_t>& tokens) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    const size_t seq_len = tokens.size();
+    const size_t hidden_size = embedding_dim;
+    if (seq_len == 0) {
+        throw std::runtime_error("EmbeddingGemma2: 输入序列为空");
+    }
+    
+    const size_t num_layers = this->text_config.value("num_hidden_layers", 0);
+    const size_t num_attention_heads = this->text_config.value("num_attention_heads", 0);
+    const float eps = this->text_config.value("rms_norm_eps", 1e-6f);
+    const int sliding_window = this->text_config.value("sliding_window", 0);
+    if (num_layers == 0 || num_attention_heads == 0) {
+        throw std::runtime_error("EmbeddingGemma2: config 缺少 num_hidden_layers / num_attention_heads");
+    }
+    
+    // 1) 词嵌入，Gemma 系列需要乘 sqrt(hidden_size)
+    std::vector<float> hidden = embedding_layer(tokens);
+    const float embed_scale = std::sqrt(static_cast<float>(hidden_size));
+    for (float& val : hidden) {
+        val *= embed_scale;
+    }
+    
+    // 2) 全局 PLE：per_layer_model_projection(无偏置) -> 缩放 -> 每层 RMSNorm
+    const std::string ple_proj_key = "language_model.ple.per_layer_model_projection.weight";
+    const std::string ple_norm_key = "language_model.ple.per_layer_projection_norm.weight";
+    const auto ple_proj_it = weights.find(ple_proj_key);
+    const auto ple_norm_it = weights.find(ple_norm_key);
+    const bool use_ple = (ple_proj_it != weights.end() && ple_norm_it != weights.end());
+    size_t per_layer_dim = hidden_size;
+    std::vector<float> per_layer_input;  // [seq_len, num_layers, per_layer_dim]
+    if (use_ple) {
+        per_layer_dim = ple_norm_it->second.size();
+        per_layer_input = cuda_matrix_ops.matrix_multiply_transpose(
+            hidden, ple_proj_it->second, seq_len, hidden_size, num_layers * per_layer_dim);
+        const float ple_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
+        for (float& val : per_layer_input) {
+            val *= ple_scale;
+        }
+        per_layer_input = cuda_matrix_ops.rms_norm(per_layer_input, ple_norm_it->second, per_layer_dim, eps);
+    }
+    
+    const float default_rope_theta = this->text_config.value("rope_theta", 1000000.0f);
+    
+    // 3) 逐层编码
+    for (size_t layer = 0; layer < num_layers; ++layer) {
+        const std::string prefix = "language_model.layers." + std::to_string(layer) + ".";
+        
+        // 该层的注意力类型决定 RoPE base 与滑动窗口
+        const std::string layer_type = (layer < layer_types.size()) ? layer_types[layer] : std::string("full_attention");
+        float rope_theta = default_rope_theta;
+        int window = 0;
+        if (layer_type == "sliding_attention" && sliding_window > 0) {
+            window = sliding_window;
+        }
+        if (this->text_config.contains("rope_parameters") &&
+            this->text_config["rope_parameters"].is_object()) {
+            const auto& rope_cfg = this->text_config["rope_parameters"];
+            if (rope_cfg.contains(layer_type) && rope_cfg[layer_type].is_object() &&
+                rope_cfg[layer_type].contains("rope_theta")) {
+                rope_theta = rope_cfg[layer_type]["rope_theta"].get<float>();
+            }
+        }
+        
+        // 3.1 Pre-Norm + 双向自注意力
+        std::vector<float> residual = hidden;
+        std::vector<float> normed = cuda_matrix_ops.rms_norm(
+            hidden, weights.at(prefix + "input_layernorm.weight"), hidden_size, eps);
+        
+        const std::vector<float>& q_weight = weights.at(prefix + "self_attn.q_proj.weight");
+        const std::vector<float>& k_weight = weights.at(prefix + "self_attn.k_proj.weight");
+        const std::vector<float>& v_weight = weights.at(prefix + "self_attn.v_proj.weight");
+        const std::vector<float>& o_weight = weights.at(prefix + "self_attn.o_proj.weight");
+        
+        const size_t q_out_dim = q_weight.size() / hidden_size;
+        const size_t head_dim = q_out_dim / num_attention_heads;
+        const size_t kv_out_dim = k_weight.size() / hidden_size;
+        const size_t num_kv_heads = kv_out_dim / head_dim;
+        if (head_dim == 0 || num_kv_heads == 0) {
+            throw std::runtime_error("EmbeddingGemma2: 注意力头维度解析失败");
+        }
+        
+        std::vector<float> q = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, q_weight, seq_len, hidden_size, q_out_dim);
+        std::vector<float> k = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, k_weight, seq_len, hidden_size, kv_out_dim);
+        std::vector<float> v = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, v_weight, seq_len, hidden_size, kv_out_dim);
+        
+        std::vector<float> attn = cuda_attention_ops.encoder_attention(
+            q, k, v,
+            weights.at(prefix + "self_attn.q_norm.weight"),
+            weights.at(prefix + "self_attn.k_norm.weight"),
+            seq_len, num_attention_heads, num_kv_heads, head_dim,
+            rope_theta,
+            1.0f,   // EmbeddingGemma2 的注意力缩放固定为 1.0（Q/K 已做 RMSNorm）
+            true,   // V 做无权重 RMSNorm
+            window,
+            eps
+        );
+        
+        std::vector<float> attn_out = cuda_matrix_ops.matrix_multiply_transpose(
+            attn, o_weight, seq_len, q_out_dim, hidden_size);
+        attn_out = cuda_matrix_ops.rms_norm(
+            attn_out, weights.at(prefix + "post_attention_layernorm.weight"), hidden_size, eps);
+        for (size_t i = 0; i < hidden.size(); ++i) {
+            hidden[i] = residual[i] + attn_out[i];
+        }
+        
+        // 3.2 Pre-Norm + MLP（gelu_pytorch_tanh 门控）
+        residual = hidden;
+        normed = cuda_matrix_ops.rms_norm(
+            hidden, weights.at(prefix + "pre_feedforward_layernorm.weight"), hidden_size, eps);
+        
+        const std::vector<float>& gate_weight = weights.at(prefix + "mlp.gate_proj.weight");
+        const std::vector<float>& up_weight = weights.at(prefix + "mlp.up_proj.weight");
+        const std::vector<float>& down_weight = weights.at(prefix + "mlp.down_proj.weight");
+        const size_t intermediate_size = gate_weight.size() / hidden_size;
+        
+        std::vector<float> mlp = cuda_matrix_ops.mlp_fused_gelu(
+            normed, gate_weight, up_weight, down_weight,
+            seq_len, hidden_size, intermediate_size);
+        mlp = cuda_matrix_ops.rms_norm(
+            mlp, weights.at(prefix + "post_feedforward_layernorm.weight"), hidden_size, eps);
+        for (size_t i = 0; i < hidden.size(); ++i) {
+            hidden[i] = residual[i] + mlp[i];
+        }
+        
+        // 3.3 PLE block：把该层的 per-layer 输入门控进残差流
+        if (use_ple) {
+            residual = hidden;
+            std::vector<float> gate = cuda_matrix_ops.matrix_multiply_transpose(
+                hidden, weights.at(prefix + "ple_block.per_layer_input_gate.weight"),
+                seq_len, hidden_size, per_layer_dim);
+            for (size_t t = 0; t < seq_len; ++t) {
+                const size_t pl_offset = (t * num_layers + layer) * per_layer_dim;
+                for (size_t d = 0; d < per_layer_dim; ++d) {
+                    gate[t * per_layer_dim + d] =
+                        gelu_tanh_scalar(gate[t * per_layer_dim + d]) * per_layer_input[pl_offset + d];
+                }
+            }
+            gate = cuda_matrix_ops.matrix_multiply_transpose(
+                gate, weights.at(prefix + "ple_block.per_layer_projection.weight"),
+                seq_len, per_layer_dim, hidden_size);
+            gate = cuda_matrix_ops.rms_norm(
+                gate, weights.at(prefix + "ple_block.post_per_layer_input_norm.weight"), hidden_size, eps);
+            for (size_t i = 0; i < hidden.size(); ++i) {
+                hidden[i] = residual[i] + gate[i];
+            }
+        }
+        
+        // 3.4 逐层标量缩放（buffer，权重文件中为 [1]）
+        const auto layer_scalar_it = weights.find(prefix + "layer_scalar");
+        if (layer_scalar_it != weights.end() && !layer_scalar_it->second.empty()) {
+            const float layer_scalar = layer_scalar_it->second[0];
+            for (float& val : hidden) {
+                val *= layer_scalar;
+            }
+        }
+    }
+    
+    // 4) 最终 RMSNorm
+    hidden = cuda_matrix_ops.rms_norm(hidden, weights.at("language_model.norm.weight"), hidden_size, eps);
+    
+    // 5) 输出投影 hidden_size -> embedding_dim
+    std::vector<float> projected;
+    const auto proj_it = weights.find("language_model.embedding_projection.weight");
+    if (proj_it != weights.end()) {
+        projected = cuda_matrix_ops.matrix_multiply_transpose(
+            hidden, proj_it->second, seq_len, hidden_size, embedding_output_dim);
+    } else {
+        projected = hidden;
+    }
+    
+    // 6) 均值池化（单条文本无 padding，所有 token 参与） + L2 归一化
+    std::vector<float> pooled(embedding_output_dim, 0.0f);
+    for (size_t t = 0; t < seq_len; ++t) {
+        for (size_t d = 0; d < embedding_output_dim; ++d) {
+            pooled[d] += projected[t * embedding_output_dim + d];
+        }
+    }
+    const float inv_count = 1.0f / static_cast<float>(seq_len);
+    float norm = 0.0f;
+    for (float& val : pooled) {
+        val *= inv_count;
+        norm += val * val;
+    }
+    norm = std::sqrt(norm);
+    if (norm > 0.0f) {
+        for (float& val : pooled) {
+            val /= norm;
+        }
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    printf("[EmbeddingGemma2 Inference Time] %lld ms\n", static_cast<long long>(duration.count()));
+    
+    return pooled;
+}
+
+std::vector<std::vector<float>> SentenceTransformerImpl::embeddinggemma2_forward_batch(
+    const std::vector<std::vector<int32_t>>& tokens_list) {
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(tokens_list.size());
+    for (const auto& tokens : tokens_list) {
+        embeddings.push_back(embeddinggemma2_forward(tokens));
+    }
+    return embeddings;
+}
+
+std::vector<float> SentenceTransformerImpl::encode(const std::string& text, const std::string& prompt_name) {
+    // 分词（如需提示词前缀，先拼接）
+    std::vector<int32_t> tokens = tokenize(apply_prompt(text, prompt_name));
     // 打印tokens
     std::cout << "tokens: " << std::endl;
     for (int token : tokens) {
@@ -689,21 +1286,65 @@ std::vector<float> SentenceTransformerImpl::encode(const std::string& text) {
     // 根据模型类型选择前向传播方法
     if (model_type == ModelType::QWEN3) {
         return qwen3_forward(tokens);
+    } else if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        return embeddinggemma2_forward(tokens);
     } else {
         return bge_forward(tokens);
     }
 }
 
-std::vector<std::vector<float>> SentenceTransformerImpl::encode_batch(const std::vector<std::string>& texts) {
-    std::vector<std::vector<float>> result;
-    for (const auto& text : texts) {
-        result.push_back(encode(text));
+std::vector<std::vector<float>> SentenceTransformerImpl::encode_batch(const std::vector<std::string>& texts, const std::string& prompt_name) {
+    if (model_type == ModelType::QWEN3) {
+        // Qwen3 模型使用批量推理
+        std::vector<std::string> prompted;
+        prompted.reserve(texts.size());
+        for (const auto& text : texts) {
+            prompted.push_back(apply_prompt(text, prompt_name));
+        }
+        auto tokens_list = tokenize_batch(prompted);
+        return qwen3_forward_batch(tokens_list);
+    } else if (model_type == ModelType::EMBEDDING_GEMMA2) {
+        // EmbeddingGemma2 的注意力是双向的，逐条处理避免 padding 干扰池化
+        std::vector<std::vector<float>> result;
+        result.reserve(texts.size());
+        for (const auto& text : texts) {
+            result.push_back(encode(text, prompt_name));
+        }
+        return result;
+    } else {
+        // 其他模型逐个处理
+        std::vector<std::vector<float>> result;
+        for (const auto& text : texts) {
+            result.push_back(encode(text, prompt_name));
+        }
+        return result;
     }
-    return result;
 }
 
 size_t SentenceTransformerImpl::get_embedding_dimension() const {
-    return embedding_dim;
+    return embedding_output_dim;
+}
+
+std::vector<std::string> SentenceTransformerImpl::get_prompt_names() const {
+    std::vector<std::string> names;
+    names.reserve(prompts.size());
+    for (const auto& item : prompts) {
+        names.push_back(item.first);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string SentenceTransformerImpl::apply_prompt(const std::string& text, const std::string& prompt_name) const {
+    if (prompt_name.empty()) {
+        return text;
+    }
+    auto it = prompts.find(prompt_name);
+    if (it == prompts.end()) {
+        // 找不到提示词时退化为原始文本，保证服务可用
+        return text;
+    }
+    return it->second + text;
 }
 
 // 实现 SentenceTransformerImpl 的 multi_head_attention 函数

@@ -18,13 +18,18 @@ public:
     ~SentenceTransformer();
 
     // 生成单个文本的嵌入
-    std::vector<float> encode(const std::string& text);
+    // prompt_name 非空时，使用模型内置的提示词前缀（如 EmbeddingGemma 的 "query" / "document"）
+    std::vector<float> encode(const std::string& text, const std::string& prompt_name = "");
 
     // 批量生成嵌入
-    std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
+    std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts,
+                                                 const std::string& prompt_name = "");
 
     // 获取嵌入维度
     size_t get_embedding_dimension() const;
+
+    // 获取模型内置的提示词名称列表
+    std::vector<std::string> get_prompt_names() const;
 
     // 禁用拷贝
     SentenceTransformer(const SentenceTransformer&) = delete;

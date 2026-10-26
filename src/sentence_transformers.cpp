@@ -11,16 +11,21 @@ SentenceTransformer::SentenceTransformer(const std::string& model_path)
 
 SentenceTransformer::~SentenceTransformer() = default;
 
-std::vector<float> SentenceTransformer::encode(const std::string& text) {
-    return impl->encode(text);
+std::vector<float> SentenceTransformer::encode(const std::string& text, const std::string& prompt_name) {
+    return impl->encode(text, prompt_name);
 }
 
-std::vector<std::vector<float>> SentenceTransformer::encode_batch(const std::vector<std::string>& texts) {
-    return impl->encode_batch(texts);
+std::vector<std::vector<float>> SentenceTransformer::encode_batch(const std::vector<std::string>& texts,
+                                                                  const std::string& prompt_name) {
+    return impl->encode_batch(texts, prompt_name);
 }
 
 size_t SentenceTransformer::get_embedding_dimension() const {
     return impl->get_embedding_dimension();
+}
+
+std::vector<std::string> SentenceTransformer::get_prompt_names() const {
+    return impl->get_prompt_names();
 }
 
 SentenceTransformer::SentenceTransformer(SentenceTransformer&&) noexcept = default;

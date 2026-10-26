@@ -20,20 +20,26 @@ using json = nlohmann::json;
 enum class ModelType {
     BGE,
     BGE_M3,
-    QWEN3  // 添加Qwen3模型类型
+    QWEN3,  // 添加Qwen3模型类型
+    EMBEDDING_GEMMA2  // EmbeddingGemma 2（Gemma 编码器架构 + PLE）
 };
 
 class SentenceTransformerImpl {
 private:
-    // 支持三种分词器
+    // 支持四种分词器
     ModelType model_type;
     std::unique_ptr<BGETokenizer> bge_tokenizer;
     std::unique_ptr<XLMRobertaTokenizer> xlmr_tokenizer;
     std::unique_ptr<Qwen3Tokenizer> qwen3_tokenizer; 
+    std::unique_ptr<GemmaTokenizer> gemma_tokenizer;
     
     std::unordered_map<std::string, int64_t> vocab;
     std::unordered_map<std::string, std::vector<float>> weights;
-    size_t embedding_dim;
+    size_t embedding_dim;        // 隐藏层维度（Transformer hidden_size）
+    size_t embedding_output_dim; // 最终输出维度（EmbeddingGemma2 的 embedding_dim）
+    nlohmann::json text_config;  // 文本塔配置（多模态模型的 text_config，其它模型等于 config）
+    std::vector<std::string> layer_types;   // 逐层注意力类型（full_attention / sliding_attention）
+    std::unordered_map<std::string, std::string> prompts;  // 提示词前缀（config_sentence_transformers.json）
     // 注释掉未使用的CPU实例
     CPUAttentionOps cpu_attention_ops; 
     CPUMatrixOps cpu_matrix_ops; 
@@ -46,6 +52,7 @@ private:
     // void load_vocab(const std::string& config_path);
     std::vector<int32_t> tokenize(const std::string& text);
     std::vector<float> embedding_layer(const std::vector<int32_t>& tokens);
+    std::vector<float> embedding_layer_batch(const std::vector<std::vector<int32_t>>& tokens_list);
     std::vector<float> add_position_encoding(const std::vector<float>& input, size_t seq_len, size_t embedding_dim);
     std::vector<float> multi_head_attention(
         const std::vector<float>& input,
@@ -71,11 +78,20 @@ private:
                                                                   float dropout_prob = 0.1f);
     std::vector<float> bge_forward(const std::vector<int32_t>& tokens);
     std::vector<float> qwen3_forward(const std::vector<int32_t>& tokens);  // 添加Qwen3前向传播函数
+    // EmbeddingGemma 2 前向传播（双向注意力编码器 + PLE + 均值池化）
+    std::vector<float> embeddinggemma2_forward(const std::vector<int32_t>& tokens);
+    std::vector<std::vector<int32_t>> tokenize_batch(const std::vector<std::string>& texts);
+    std::vector<std::vector<float>> qwen3_forward_batch(const std::vector<std::vector<int32_t>>& tokens_list);
+    std::vector<std::vector<float>> embeddinggemma2_forward_batch(const std::vector<std::vector<int32_t>>& tokens_list);
+    // 为文本添加提示词前缀（EmbeddingGemma 系列的 query/document 前缀）
+    std::string apply_prompt(const std::string& text, const std::string& prompt_name) const;
 
 public:
     // 支持三种构造函数，一种用于传统BGE模型，一种用于BGE-M3模型，一种用于Qwen3模型    SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
     SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
-     std::vector<float> encode(const std::string& text);
-    std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
+     std::vector<float> encode(const std::string& text, const std::string& prompt_name = "");
+    std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts, const std::string& prompt_name = "");
     size_t get_embedding_dimension() const;
+    // 模型内置的提示词名称列表（如 query / document / STS ...）
+    std::vector<std::string> get_prompt_names() const;
 };

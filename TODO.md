@@ -18,6 +18,7 @@
 14. [x] 支持Qwen3-embedding模型
 15. [ ] 支持rpc调用
 16. [ ] fastattn调用优化
+32. [x] 支持 EmbeddingGemma 2 模型（文本塔：双向注意力 + PLE + 768 维输出）
 
 ### 性能优化
 

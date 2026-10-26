@@ -762,3 +762,129 @@ std::string Qwen3Tokenizer::decode(const std::vector<int>& token_ids) {
     }
     return decoded_text;
 }
+
+// ============ GemmaTokenizer implementation ============
+// Gemma / EmbeddingGemma 使用 SentencePiece（unigram）分词器：
+//   - 输入文本会做 add_dummy_prefix 处理（句首补 ▁）
+//   - 序列以 <bos> 开头，且（embedding 场景）不追加 <eos>
+GemmaTokenizer::GemmaTokenizer(const std::string& sentencepiece_model_path,
+                               const std::string& tokenizer_config_path,
+                               bool append_eos)
+    : bos_token_id(2), eos_token_id(1), unk_token_id(3), pad_token_id(0), append_eos(append_eos) {
+    sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+    auto status = sp_processor->Load(sentencepiece_model_path);
+    if (!status.ok()) {
+        throw std::runtime_error("无法加载 Gemma SentencePiece 模型: " + status.ToString());
+    }
+
+    // 用 SentencePiece 的词表填充映射表，便于按 token 查 id
+    const int piece_size = sp_processor->GetPieceSize();
+    for (int id = 0; id < piece_size; ++id) {
+        const std::string piece = sp_processor->IdToPiece(id);
+        vocab[piece] = id;
+        id_to_token[id] = piece;
+    }
+
+    // SentencePiece 模型自带特殊 token id，优先使用
+    if (sp_processor->bos_id() >= 0) bos_token_id = sp_processor->bos_id();
+    if (sp_processor->eos_id() >= 0) eos_token_id = sp_processor->eos_id();
+    if (sp_processor->unk_id() >= 0) unk_token_id = sp_processor->unk_id();
+    if (sp_processor->pad_id() >= 0) pad_token_id = sp_processor->pad_id();
+
+    // tokenizer_config.json 中记录了特殊 token 的字符串形式，据此校正 id
+    if (!tokenizer_config_path.empty()) {
+        std::ifstream cfg_file(tokenizer_config_path);
+        if (cfg_file.is_open()) {
+            nlohmann::json cfg;
+            try {
+                cfg_file >> cfg;
+            } catch (const std::exception&) {
+                cfg = nlohmann::json::object();
+            }
+            auto lookup = [&](const char* key) -> int {
+                if (!cfg.contains(key)) return -1;
+                const auto& value = cfg[key];
+                std::string token;
+                if (value.is_string()) {
+                    token = value.get<std::string>();
+                } else if (value.is_object() && value.contains("content")) {
+                    token = value["content"].get<std::string>();
+                } else {
+                    return -1;
+                }
+                auto it = vocab.find(token);
+                return it == vocab.end() ? -1 : it->second;
+            };
+            if (int id = lookup("bos_token"); id >= 0) bos_token_id = id;
+            if (int id = lookup("eos_token"); id >= 0) eos_token_id = id;
+            if (int id = lookup("unk_token"); id >= 0) unk_token_id = id;
+            if (int id = lookup("pad_token"); id >= 0) pad_token_id = id;
+        }
+    }
+
+    std::cout << "[GemmaTokenizer] vocab=" << vocab.size()
+              << ", BOS=" << bos_token_id << ", EOS=" << eos_token_id
+              << ", PAD=" << pad_token_id << std::endl;
+}
+
+std::vector<std::string> GemmaTokenizer::tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    auto status = sp_processor->Encode(text, &tokens);
+    if (!status.ok()) {
+        throw std::runtime_error("Gemma SentencePiece 分词失败: " + status.ToString());
+    }
+    // 过滤掉可能出现的 <bos> / <eos>（由 encode 统一添加）
+    std::vector<std::string> filtered;
+    filtered.reserve(tokens.size());
+    for (const auto& token : tokens) {
+        if (token == "<bos>" || token == "<eos>" || token == "</s>" || token == "<s>") continue;
+        filtered.push_back(token);
+    }
+    return filtered;
+}
+
+std::vector<int> GemmaTokenizer::encode(const std::vector<std::string>& tokens) {
+    std::vector<int> token_ids;
+    token_ids.reserve(tokens.size() + 1);
+
+    // Gemma 在句首添加 <bos>
+    if (bos_token_id >= 0) {
+        token_ids.push_back(bos_token_id);
+    }
+
+    for (const auto& token : tokens) {
+        auto it = vocab.find(token);
+        if (it != vocab.end()) {
+            token_ids.push_back(it->second);
+        } else {
+            // 回退到 SentencePiece 自身的 id 映射
+            const int id = sp_processor->PieceToId(token);
+            token_ids.push_back(id >= 0 ? id : unk_token_id);
+        }
+    }
+    // 注意：与 HF Gemma tokenizer 保持一致（post_processor 会追加 <eos>）
+    if (append_eos && eos_token_id >= 0) {
+        token_ids.push_back(eos_token_id);
+    }
+    return token_ids;
+}
+
+std::vector<int32_t> GemmaTokenizer::encode_text(const std::string& text) {
+    const std::vector<int> ids = encode(tokenize(text));
+    return std::vector<int32_t>(ids.begin(), ids.end());
+}
+
+std::string GemmaTokenizer::decode(const std::vector<int>& token_ids) {
+    std::string text;
+    auto status = sp_processor->Decode(token_ids, &text);
+    if (status.ok()) {
+        return text;
+    }
+    for (int id : token_ids) {
+        auto it = id_to_token.find(id);
+        if (it != id_to_token.end()) {
+            text += it->second;
+        }
+    }
+    return text;
+}

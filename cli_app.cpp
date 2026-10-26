@@ -7,13 +7,14 @@
 int main(int argc, char* argv[]) {
     try {
         // 命令行参数检查
-        if (argc != 2) {
-            std::cerr << "Usage: " << argv[0] << " <model_path>" << std::endl;
+        if (argc != 2 && argc != 3) {
+            std::cerr << "Usage: " << argv[0] << " <model_path> [prompt_name]" << std::endl;
             return 1;
         }
 
         // 加载模型（仅加载一次）
         std::string model_path = argv[1];
+        std::string prompt_name = (argc == 3) ? argv[2] : "";
         SentenceTransformer model(model_path);
         std::cout << "模型加载成功，可开始输入文本（输入exit退出）...\n" << std::endl;
 
@@ -38,7 +39,7 @@ int main(int argc, char* argv[]) {
 
             // 处理单轮文本
             std::vector<std::string> texts = {input_text};
-            std::vector<std::vector<float>> embeddings = model.encode_batch(texts);
+            std::vector<std::vector<float>> embeddings = model.encode_batch(texts, prompt_name);
 
             // 输出结果
             std::cout << "embedding shape: " << embeddings[0].size() << std::endl;

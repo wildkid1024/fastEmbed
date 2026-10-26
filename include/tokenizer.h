@@ -86,4 +86,41 @@ public:
     int get_im_end_token_id() const { return im_end_token_id; }
 };
 
+// GemmaTokenizer类定义，用于 Gemma / EmbeddingGemma 系列模型
+// Gemma 使用 SentencePiece（unigram + byte fallback），序列以 <bos> 开头且不以 <eos> 结尾
+class GemmaTokenizer {
+private:
+    std::unordered_map<std::string, int> vocab;
+    std::unordered_map<int, std::string> id_to_token;
+
+    // 特殊token ID
+    int bos_token_id;  // <bos>，Gemma 默认 2
+    int eos_token_id;  // <eos>，Gemma 默认 1
+    int unk_token_id;  // <unk>
+    int pad_token_id;  // <pad>，Gemma 默认 0
+
+    // SentencePiece处理器
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> sp_processor;
+    // 是否在序列末尾追加 <eos>（HF 的 Gemma tokenizer 默认会追加）
+    bool append_eos;
+
+public:
+    // sentencepiece_model_path: tokenizer.model；tokenizer_config_path: tokenizer_config.json（可选，用于读取特殊token id）
+    GemmaTokenizer(const std::string& sentencepiece_model_path,
+                   const std::string& tokenizer_config_path = "",
+                   bool append_eos = true);
+
+    std::vector<std::string> tokenize(const std::string& text);
+    std::vector<int> encode(const std::vector<std::string>& tokens);
+    std::string decode(const std::vector<int>& token_ids);
+
+    // 添加获取特殊token ID的方法
+    int get_bos_token_id() const { return bos_token_id; }
+    int get_eos_token_id() const { return eos_token_id; }
+    int get_unk_token_id() const { return unk_token_id; }
+    int get_pad_token_id() const { return pad_token_id; }
+    // 直接对文本编码（含 <bos> 前缀，不含 <eos>）
+    std::vector<int32_t> encode_text(const std::string& text);
+};
+
 #endif // TOKENIZER_H

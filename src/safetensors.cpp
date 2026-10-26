@@ -28,7 +28,8 @@ float bf16_to_f32(uint16_t bf16_value) {
 }
 
 // 加载 safetensors 文件
-bool load_single_safetensors_file(const std::string& file_path, std::unordered_map<std::string, std::vector<float>>& weights) {
+bool load_single_safetensors_file(const std::string& file_path, std::unordered_map<std::string, std::vector<float>>& weights,
+                                  const std::vector<std::string>& skip_prefixes) {
     try {
         std::ifstream file(file_path, std::ios::binary);
         if (!file) {
@@ -49,6 +50,18 @@ bool load_single_safetensors_file(const std::string& file_path, std::unordered_m
         // 遍历所有张量
         for (const auto& [name, tensor_info] : header.items()) {
             if (name == "__metadata__") {
+                continue;
+            }
+            
+            // 按前缀过滤（例如仅保留文本塔，跳过视觉/音频塔）
+            bool skip = false;
+            for (const auto& prefix : skip_prefixes) {
+                if (!prefix.empty() && name.rfind(prefix, 0) == 0) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) {
                 continue;
             }
             

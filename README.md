@@ -9,7 +9,7 @@ fastEmbed 是一个高性能文本嵌入（Text Embedding）推理框架，采�
 - **极致轻量化**：编译后二进制文件仅约 2MB，无 Python 依赖
 - **纯 C++/CUDA 实现**：直接对接底层硬件加速，支持 GPU 批量推理
 - **隐私保护**：支持完全离线运行，数据无需上传云端
-- **多模型支持**：内置 BGE 系列和 Qwen3-Embedding 系列模型
+- **多模型支持**：内置 BGE 系列、Qwen3-Embedding 系列和 EmbeddingGemma 2
 
 ## 快速开始
 
@@ -41,6 +41,13 @@ make -j
 | BGE | bge-large-zh-v1.5 | 中文 | 1024 | 512 | 高精度中文理解 |
 | BGE | bge-m3 | 多语言 | 1024 | 512 | 多语言、多粒度检索 |
 | Qwen3 | Qwen3-Embedding-0.6B | 中英双语 | 1024 | 8192 | 长文档理解、复杂推理 |
+| EmbeddingGemma | embeddinggemma-2 | 多语言（文本塔） | 768 | 2048 | 高精度多语言检索、可截断维度 |
+
+> EmbeddingGemma 2 说明：
+> - 纯 C++/CUDA 复刻了官方 `EmbeddingGemma2Model` 的**文本塔**（24 层双向编码器 + PLE 每层输入 + `gelu_pytorch_tanh` MLP），输出 768 维，均值池化后 L2 归一化；
+> - 支持官方内置的 20 个任务提示词（`query` / `Document` / `SearchQuery` / `STS` …），通过 `prompt_name` 参数启用；
+> - 支持 Matryoshka 维度截断，客户端取前 768/512/256/128 维后**需重新归一化**（本服务默认返回完整 768 维并已归一化）；
+> - 视觉/音频塔尚未实现，本服务仅支持文本输入。
 
 ### 系统要求
 
@@ -74,6 +81,9 @@ huggingface-cli download BAAI/bge-m3 --local-dir ./models/bge-m3
 
 # Qwen3-Embedding 系列模型
 huggingface-cli download Qwen/Qwen3-Embedding-0.6B --local-dir ./models/qwen3
+
+# EmbeddingGemma 2（需要 tokenizer.model + model.safetensors 等完整目录）
+huggingface-cli download google/embeddinggemma-2 --local-dir ./models/embeddinggemma-2
 ```
 
 ### 启动 HTTP 服务
@@ -132,8 +142,33 @@ embeddings = [item["embedding"] for item in response.json()["data"]]
 print(f"批量生成 {len(embeddings)} 个嵌入向量")
 ```
 
-### 命令行工具
+#### 使用内置提示词（EmbeddingGemma 2）
 
+EmbeddingGemma 2 训练时给文本加了任务指令前缀，检索场景下建议 query 和 document 分别使用不同前缀：
+
+```bash
+# query 侧
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": "北极光是怎么形成的？", "prompt_name": "SearchQuery"}'
+
+# document 侧（无标题时用 Document，前缀为 "title: none | text: "）
+curl -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": "北极光由太阳带电粒子与高层大气相互作用产生。", "prompt_name": "Document"}'
+```
+
+`prompt_name` 可选值来自模型的 `config_sentence_transformers.json`，例如
+`SearchQuery`、`Document`、`STS`、`Classification`、`Clustering`、`QuestionAnswering`、`CodeRetrieval` 等。
+不传该字段则直接对原文编码（效果略降但可用）。C++ API 用法相同：
+
+```cpp
+SentenceTransformer model("./models/embeddinggemma-2");
+auto query_emb = model.encode("北极光是怎么形成的？", "SearchQuery");
+auto doc_emb   = model.encode("北极光由太阳带电粒子与高层大气相互作用产生。", "Document");
+```
+
+### 命令行工具
 fastEmbed 还提供命令行工具用于快速测试：
 
 ```bash

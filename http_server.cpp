@@ -84,8 +84,10 @@ int main(int argc, char* argv[]) {
                 }
                 
                 std::string text = req_json["text"];
+                // 可选：使用模型内置的提示词前缀（如 EmbeddingGemma 的 query/document）
+                std::string prompt_name = req_json.value("prompt_name", std::string(""));
                 std::vector<std::string> texts = {text};
-                std::vector<std::vector<float>> embeddings = model.encode_batch(texts);
+                std::vector<std::vector<float>> embeddings = model.encode_batch(texts, prompt_name);
 
                 // Return result
                 nlohmann::json res_json;
@@ -133,7 +135,9 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Generate embeddings
-                std::vector<std::vector<float>> embeddings = model.encode_batch(texts);
+                // 可选：使用模型内置的提示词前缀（如 EmbeddingGemma 的 query/document）
+                std::string prompt_name = req_json.value("prompt_name", std::string(""));
+                std::vector<std::vector<float>> embeddings = model.encode_batch(texts, prompt_name);
 
                 // Format response according to OpenAI spec
                 nlohmann::json response_json;

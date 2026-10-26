@@ -56,7 +56,9 @@ if(USE_CUDA)
         # 使用 cuBLAS 的 CUDA 源文件
         file(GLOB CUDA_BASE_SOURCES "src/ops/cuda/cuda_matrix_ops.cu")
         file(GLOB CUDA_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_cublas_ops.cu")
-        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES})
+        # 编码器（双向）注意力实现，Gemma / EmbeddingGemma 使用
+        set(CUDA_ENCODER_SOURCES "src/ops/cuda/cuda_encoder_attention_ops.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES})
         # 添加 cuBLAS 库
         set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas ${SENTENCEPIECE_LIBRARIES})
     else()
@@ -64,7 +66,9 @@ if(USE_CUDA)
         # 不使用 cuBLAS 的 CUDA 源文件
         file(GLOB CUDA_BASE_SOURCES "src/ops/cuda/cuda_matrix_ops.cu")
         file(GLOB CUDA_NON_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_ops.cu")
-        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES})
+        # 编码器（双向）注意力实现，Gemma / EmbeddingGemma 使用
+        set(CUDA_ENCODER_SOURCES "src/ops/cuda/cuda_encoder_attention_ops.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES})
         # 不添加 cuBLAS 库
         set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} ${SENTENCEPIECE_LIBRARIES})
     endif()
@@ -90,9 +94,11 @@ endif()
 if(USE_CUDA)
     add_executable(app app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
     add_executable(cli cli_app.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
+    add_executable(benchmark_cpp benchmark_cpp.cpp ${CPP_SOURCES} ${CUDA_SOURCES})
 else()
     add_executable(app app.cpp ${CPP_SOURCES})
     add_executable(cli cli_app.cpp ${CPP_SOURCES})
+    add_executable(benchmark_cpp benchmark_cpp.cpp ${CPP_SOURCES})
 endif()
 
 # 查找并链接 nlohmann_json 库
@@ -105,6 +111,11 @@ target_link_libraries(app
 )
 
 target_link_libraries(cli 
+    ${ADDITIONAL_LIBS}
+    nlohmann_json::nlohmann_json
+)
+
+target_link_libraries(benchmark_cpp 
     ${ADDITIONAL_LIBS}
     nlohmann_json::nlohmann_json
 )
