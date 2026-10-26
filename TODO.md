@@ -19,6 +19,10 @@
 15. [ ] 支持rpc调用
 16. [ ] fastattn调用优化
 32. [x] 支持 EmbeddingGemma 2 模型（文本塔：双向注意力 + PLE + 768 维输出）
+33. [x] 支持 EmbeddingGemma 2 图像编码器（Gemma4 视觉塔：patch 嵌入 + 轴向 2D RoPE + 3x3 池化 + soft token 融合）
+34. [ ] 音频编码器（Gemma4 Audio 塔，模型里同样有 embed_audio 权重）
+35. [ ] 视频帧编码（复用视觉塔 + VideoProcessor 的时间戳/帧采样）
+36. [ ] 图像编码的批量并行（当前逐张编码，视觉塔 2520 patch 的注意力较占算力）
 
 ### 性能优化
 

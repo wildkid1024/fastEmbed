@@ -77,14 +77,14 @@ if(USE_CUDA)
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cuda/*.cpp")
 
     # Include directories
-    include_directories(${CUDA_INCLUDE_DIRS} include include/ops ${SENTENCEPIECE_INCLUDE_DIR})
+    include_directories(${CUDA_INCLUDE_DIRS} include include/ops third_party/stb ${SENTENCEPIECE_INCLUDE_DIR})
 else()
     # 仅查找非 CUDA 相关的 C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cpu/*.cpp")
     # list(FILTER CPP_SOURCES EXCLUDE REGEX "src/ops/cpu/.*\\.cpp")
 
     # Include directories
-    include_directories(include include/ops ${SENTENCEPIECE_INCLUDE_DIR})
+    include_directories(include include/ops third_party/stb ${SENTENCEPIECE_INCLUDE_DIR})
 
     # 添加 sentencepiece 库
     set(ADDITIONAL_LIBS ${SENTENCEPIECE_LIBRARIES})

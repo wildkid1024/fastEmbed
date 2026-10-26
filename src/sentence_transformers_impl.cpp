@@ -273,10 +273,10 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
     }
     
     std::string tensor_path = model_path + "/model.safetensors";
-    // 多模态模型只保留文本塔，跳过视觉/音频塔（可省下约 0.9GB 权重）
+    // 多模态模型保留文本塔与视觉塔（图像编码器），跳过音频塔以省内存
     std::vector<std::string> skip_prefixes;
     if (this->model_type == ModelType::EMBEDDING_GEMMA2) {
-        skip_prefixes = {"vision_tower.", "audio_tower.", "embed_vision.", "embed_audio."};
+        skip_prefixes = {"audio_tower.", "embed_audio."};
     }
     if (!load_single_safetensors_file(tensor_path, weights, skip_prefixes)) {
         throw std::runtime_error("加载模型权重失败");
@@ -321,6 +321,73 @@ SentenceTransformerImpl::SentenceTransformerImpl(const std::string& model_path, 
                   << ", layers=" << this->text_config.value("num_hidden_layers", 0)
                   << ", heads=" << this->text_config.value("num_attention_heads", 0)
                   << std::endl;
+        
+        // ===== 视觉塔（图像编码器）初始化 =====
+        has_vision_tower = weights.find("vision_tower.patch_embedder.input_proj.weight") != weights.end() &&
+                           weights.find("embed_vision.embedding_projection.weight") != weights.end();
+        if (has_vision_tower) {
+            if (this->config.contains("vision_config") && this->config["vision_config"].is_object()) {
+                vision_config = this->config["vision_config"];
+            }
+            vision_hidden_size = vision_config.value("hidden_size", 768);
+            vision_num_layers = vision_config.value("num_hidden_layers", 0);
+            vision_num_heads = vision_config.value("num_attention_heads", 0);
+            vision_num_kv_heads = vision_config.value("num_key_value_heads", vision_num_heads);
+            vision_intermediate_size = vision_config.value("intermediate_size", 0);
+            vision_patch_size = vision_config.value("patch_size", 16);
+            vision_pooling_kernel = vision_config.value("pooling_kernel_size", 3);
+            vision_head_dim = vision_config.contains("head_dim")
+                ? vision_config["head_dim"].get<size_t>()
+                : (vision_num_heads > 0 ? vision_hidden_size / vision_num_heads : 0);
+            vision_eps = vision_config.value("rms_norm_eps", 1e-6f);
+            if (vision_config.contains("rope_parameters") && vision_config["rope_parameters"].is_object()) {
+                vision_rope_theta = vision_config["rope_parameters"].value("rope_theta", 100.0f);
+            }
+            
+            // 每张图的 soft token 上限：processor_config.json 的 image_seq_length
+            std::string processor_config_path = model_path + "/processor_config.json";
+            size_t max_soft_tokens = 280;
+            if (std::filesystem::exists(processor_config_path)) {
+                std::ifstream pc_file(processor_config_path);
+                if (pc_file.is_open()) {
+                    try {
+                        nlohmann::json pc;
+                        pc_file >> pc;
+                        if (pc.contains("image_seq_length") && pc["image_seq_length"].is_number_integer()) {
+                            max_soft_tokens = pc["image_seq_length"].get<size_t>();
+                        }
+                        if (pc.contains("image_processor") && pc["image_processor"].is_object()) {
+                            const auto& ip = pc["image_processor"];
+                            vision_patch_size = ip.value("patch_size", vision_patch_size);
+                            vision_pooling_kernel = ip.value("pooling_kernel_size", vision_pooling_kernel);
+                            if (ip.contains("max_soft_tokens")) {
+                                max_soft_tokens = ip["max_soft_tokens"].get<size_t>();
+                            }
+                        }
+                    } catch (const std::exception&) {
+                        // 保持默认值
+                    }
+                }
+            }
+            vision_max_patches = max_soft_tokens * vision_pooling_kernel * vision_pooling_kernel;
+            
+            // 图像占位 token
+            image_token_id = this->config.value("image_token_id", 0);
+            boi_token_id = this->config.value("boi_token_id", 0);
+            eoi_token_id = this->config.value("eoi_token_id", 0);
+            
+            std::cout << "视觉塔: hidden=" << vision_hidden_size
+                      << ", layers=" << vision_num_layers
+                      << ", heads=" << vision_num_heads << "/" << vision_num_kv_heads
+                      << ", patch=" << vision_patch_size
+                      << ", max_patches=" << vision_max_patches
+                      << ", rope_theta=" << vision_rope_theta
+                      << ", image_token=" << image_token_id
+                      << ", boi=" << boi_token_id << ", eoi=" << eoi_token_id
+                      << std::endl;
+        } else {
+            std::cout << "未找到视觉塔权重，仅支持文本嵌入" << std::endl;
+        }
     }
 }
 
@@ -1062,13 +1129,35 @@ inline float gelu_tanh_scalar(float x) {
 }  // namespace
 
 std::vector<float> SentenceTransformerImpl::embeddinggemma2_forward(const std::vector<int32_t>& tokens) {
+    const size_t seq_len = tokens.size();
+    if (seq_len == 0) {
+        throw std::runtime_error("EmbeddingGemma2: 输入序列为空");
+    }
+    
+    // 1) 词嵌入，Gemma 系列需要乘 sqrt(hidden_size)
+    std::vector<float> inputs_embeds = embedding_layer(tokens);
+    const float embed_scale = std::sqrt(static_cast<float>(embedding_dim));
+    for (float& val : inputs_embeds) {
+        val *= embed_scale;
+    }
+    return embeddinggemma2_embeds_forward(inputs_embeds, seq_len);
+}
+
+std::vector<float> SentenceTransformerImpl::embeddinggemma2_embeds_forward(
+    const std::vector<float>& inputs_embeds, size_t seq_len) {
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    const size_t seq_len = tokens.size();
     const size_t hidden_size = embedding_dim;
     if (seq_len == 0) {
         throw std::runtime_error("EmbeddingGemma2: 输入序列为空");
     }
+    if (inputs_embeds.size() != seq_len * hidden_size) {
+        throw std::runtime_error("EmbeddingGemma2: inputs_embeds 尺寸不匹配");
+    }
+    if (seq_len > 1000000) {
+        throw std::runtime_error("EmbeddingGemma2: 序列过长");
+    }
+    std::vector<float> hidden = inputs_embeds;
     
     const size_t num_layers = this->text_config.value("num_hidden_layers", 0);
     const size_t num_attention_heads = this->text_config.value("num_attention_heads", 0);
@@ -1076,13 +1165,6 @@ std::vector<float> SentenceTransformerImpl::embeddinggemma2_forward(const std::v
     const int sliding_window = this->text_config.value("sliding_window", 0);
     if (num_layers == 0 || num_attention_heads == 0) {
         throw std::runtime_error("EmbeddingGemma2: config 缺少 num_hidden_layers / num_attention_heads");
-    }
-    
-    // 1) 词嵌入，Gemma 系列需要乘 sqrt(hidden_size)
-    std::vector<float> hidden = embedding_layer(tokens);
-    const float embed_scale = std::sqrt(static_cast<float>(hidden_size));
-    for (float& val : hidden) {
-        val *= embed_scale;
     }
     
     // 2) 全局 PLE：per_layer_model_projection(无偏置) -> 缩放 -> 每层 RMSNorm
@@ -1271,6 +1353,252 @@ std::vector<std::vector<float>> SentenceTransformerImpl::embeddinggemma2_forward
         embeddings.push_back(embeddinggemma2_forward(tokens));
     }
     return embeddings;
+}
+
+// ===== 视觉塔（图像编码器）前向 =====
+// 对齐 transformers 的 Gemma4VisionModel：
+//   patch_embedder(2*(x-0.5) -> Linear -> +2D位置嵌入) -> 16 层双向编码 -> 3x3 位置均值池化
+//   -> ×sqrt(hidden) -> embed_vision（无权重 RMSNorm + 投影到文本 hidden）
+std::vector<float> SentenceTransformerImpl::embeddinggemma2_vision_forward(const GemmaImageInput& image) {
+    if (!has_vision_tower) {
+        throw std::runtime_error("当前模型没有可用的视觉塔权重");
+    }
+    const size_t num_patches = image.num_patches;
+    const size_t hidden = vision_hidden_size;
+    const size_t head_dim = vision_head_dim;
+    const size_t q_out_dim = vision_num_heads * head_dim;
+    const size_t kv_out_dim = vision_num_kv_heads * head_dim;
+    // 每个 patch 的展开长度 = 3 * patch^2（本模型为 768，与 hidden 恰好相等）
+    const size_t patch_pixels = 3 * vision_patch_size * vision_patch_size;
+    if (num_patches == 0 || hidden == 0 || head_dim == 0 || patch_pixels == 0) {
+        throw std::runtime_error("视觉塔: 维度参数非法");
+    }
+    if (image.pixel_values.size() != num_patches * patch_pixels) {
+        throw std::runtime_error("视觉塔: patch 维度与 patch_size 不匹配");
+    }
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // 1) patch 归一化：2*(x-0.5)，然后 input_proj（patch_pixels -> hidden，无偏置）
+    std::vector<float> patches = image.pixel_values;
+    for (float& val : patches) {
+        val = 2.0f * (val - 0.5f);
+    }
+    std::vector<float> hidden_states = cuda_matrix_ops.matrix_multiply_transpose(
+        patches, weights.at("vision_tower.patch_embedder.input_proj.weight"),
+        num_patches, patch_pixels, hidden);
+
+    // 2) 2D 位置嵌入：table [2, position_embedding_size, hidden]，x/y 分别查表后相加
+    {
+        const std::vector<float>& pos_table = weights.at("vision_tower.patch_embedder.position_embedding_table");
+        const size_t pos_size = pos_table.size() / (2 * hidden);
+        if (pos_size == 0) {
+            throw std::runtime_error("视觉塔: 位置嵌入表尺寸异常");
+        }
+        for (size_t p = 0; p < num_patches; ++p) {
+            if (image.valid[p] == 0) {
+                continue;  // padding patch 的位置嵌入置 0
+            }
+            int x = image.position_ids[p * 2];
+            int y = image.position_ids[p * 2 + 1];
+            x = std::max(0, std::min(x, static_cast<int>(pos_size) - 1));
+            y = std::max(0, std::min(y, static_cast<int>(pos_size) - 1));
+            const float* emb_x = pos_table.data() + static_cast<size_t>(x) * hidden;
+            const float* emb_y = pos_table.data() + (pos_size + static_cast<size_t>(y)) * hidden;
+            float* dst = hidden_states.data() + p * hidden;
+            for (size_t d = 0; d < hidden; ++d) {
+                dst[d] += emb_x[d] + emb_y[d];
+            }
+        }
+    }
+
+    // 3) 逐层编码（Pre-Norm + 双向注意力 + GELU 门控 MLP）
+    for (size_t layer = 0; layer < vision_num_layers; ++layer) {
+        const std::string prefix = "vision_tower.encoder.layers." + std::to_string(layer) + ".";
+
+        // 3.1 自注意力
+        std::vector<float> residual = hidden_states;
+        std::vector<float> normed = cuda_matrix_ops.rms_norm(
+            hidden_states, weights.at(prefix + "input_layernorm.weight"), hidden, vision_eps);
+
+        std::vector<float> q = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, weights.at(prefix + "self_attn.q_proj.linear.weight"),
+            num_patches, hidden, q_out_dim);
+        std::vector<float> k = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, weights.at(prefix + "self_attn.k_proj.linear.weight"),
+            num_patches, hidden, kv_out_dim);
+        std::vector<float> v = cuda_matrix_ops.matrix_multiply_transpose(
+            normed, weights.at(prefix + "self_attn.v_proj.linear.weight"),
+            num_patches, hidden, kv_out_dim);
+
+        std::vector<float> attn = cuda_attention_ops.vision_attention(
+            q, k, v,
+            weights.at(prefix + "self_attn.q_norm.weight"),
+            weights.at(prefix + "self_attn.k_norm.weight"),
+            image.position_ids, image.valid,
+            num_patches, vision_num_heads, vision_num_kv_heads, head_dim,
+            vision_rope_theta,
+            1.0f,        // Gemma4 视觉塔的注意力缩放固定为 1.0
+            vision_eps);
+
+        std::vector<float> attn_out = cuda_matrix_ops.matrix_multiply_transpose(
+            attn, weights.at(prefix + "self_attn.o_proj.linear.weight"),
+            num_patches, q_out_dim, hidden);
+        attn_out = cuda_matrix_ops.rms_norm(
+            attn_out, weights.at(prefix + "post_attention_layernorm.weight"), hidden, vision_eps);
+        for (size_t i = 0; i < hidden_states.size(); ++i) {
+            hidden_states[i] = residual[i] + attn_out[i];
+        }
+
+        // 3.2 前馈网络（gelu_pytorch_tanh 门控）
+        residual = hidden_states;
+        normed = cuda_matrix_ops.rms_norm(
+            hidden_states, weights.at(prefix + "pre_feedforward_layernorm.weight"), hidden, vision_eps);
+        std::vector<float> mlp = cuda_matrix_ops.mlp_fused_gelu(
+            normed,
+            weights.at(prefix + "mlp.gate_proj.linear.weight"),
+            weights.at(prefix + "mlp.up_proj.linear.weight"),
+            weights.at(prefix + "mlp.down_proj.linear.weight"),
+            num_patches, hidden, vision_intermediate_size);
+        mlp = cuda_matrix_ops.rms_norm(
+            mlp, weights.at(prefix + "post_feedforward_layernorm.weight"), hidden, vision_eps);
+        for (size_t i = 0; i < hidden_states.size(); ++i) {
+            hidden_states[i] = residual[i] + mlp[i];
+        }
+    }
+
+    // 4) 3x3 位置均值池化：每个块 = 9 个 patch 的平均（padding patch 置 0 后不贡献）
+    const size_t k = vision_pooling_kernel;
+    const size_t grid_h = image.patch_grid_h;
+    const size_t grid_w = image.patch_grid_w;
+    const size_t blocks_per_row = grid_w / k;
+    const size_t num_soft_tokens = image.num_real_patches / (k * k);
+    if (num_soft_tokens == 0 || blocks_per_row == 0) {
+        throw std::runtime_error("视觉塔: 池化后 soft token 数为 0");
+    }
+    std::vector<float> pooled(num_soft_tokens * hidden, 0.0f);
+    const float inv_k2 = 1.0f / static_cast<float>(k * k);
+    for (size_t py = 0; py < grid_h; ++py) {
+        for (size_t px = 0; px < grid_w; ++px) {
+            const size_t patch_idx = py * grid_w + px;
+            const size_t block = (py / k) * blocks_per_row + (px / k);
+            if (block >= num_soft_tokens || image.valid[patch_idx] == 0) {
+                continue;
+            }
+            const float* src = hidden_states.data() + patch_idx * hidden;
+            float* dst = pooled.data() + block * hidden;
+            for (size_t d = 0; d < hidden; ++d) {
+                dst[d] += src[d] * inv_k2;
+            }
+        }
+    }
+
+    // 5) ×sqrt(hidden_size)
+    const float root_scale = std::sqrt(static_cast<float>(hidden));
+    for (float& val : pooled) {
+        val *= root_scale;
+    }
+
+    // 6) embed_vision：无权重 RMSNorm（权重全 1） + 投影到文本 hidden
+    std::vector<float> unit_weight(hidden, 1.0f);
+    std::vector<float> normed_pooled = cuda_matrix_ops.rms_norm(pooled, unit_weight, hidden, vision_eps);
+    std::vector<float> projected = cuda_matrix_ops.matrix_multiply_transpose(
+        normed_pooled, weights.at("embed_vision.embedding_projection.weight"),
+        num_soft_tokens, hidden, embedding_dim);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    printf("[Vision Inference Time] %lld ms (%zu patches -> %zu soft tokens)\n",
+           static_cast<long long>(duration.count()), num_patches, num_soft_tokens);
+
+    return projected;
+}
+
+// 图像嵌入：视觉 soft token 替换文本序列中的 <image> 占位，再过语言模型
+std::vector<float> SentenceTransformerImpl::embeddinggemma2_image_embedding(const GemmaImageInput& image) {
+    if (!has_vision_tower) {
+        throw std::runtime_error("当前模型没有可用的视觉塔权重");
+    }
+    if (image_token_id == 0 || boi_token_id == 0 || eoi_token_id == 0) {
+        throw std::runtime_error("配置缺少 image_token_id / boi_token_id / eoi_token_id，无法拼接图像序列");
+    }
+    const size_t k = vision_pooling_kernel;
+    const size_t num_soft_tokens = image.num_real_patches / (k * k);
+    if (num_soft_tokens == 0) {
+        throw std::runtime_error("图像编码失败: soft token 数为 0");
+    }
+
+    // 1) 视觉塔 -> [num_soft_tokens, text_hidden]
+    std::vector<float> soft_tokens = embeddinggemma2_vision_forward(image);
+    const size_t text_hidden = embedding_dim;
+    if (soft_tokens.size() != num_soft_tokens * text_hidden) {
+        throw std::runtime_error("图像编码失败: soft token 维度异常");
+    }
+
+    // 2) 构造序列：[bos] + [boi] + [image] * n + [eoi] + [eos]
+    std::vector<int32_t> tokens;
+    tokens.reserve(num_soft_tokens + 4);
+    if (gemma_tokenizer) {
+        tokens.push_back(static_cast<int32_t>(gemma_tokenizer->get_bos_token_id()));
+    }
+    if (boi_token_id > 0) {
+        tokens.push_back(static_cast<int32_t>(boi_token_id));
+    }
+    const size_t image_start = tokens.size();
+    for (size_t i = 0; i < num_soft_tokens; ++i) {
+        tokens.push_back(static_cast<int32_t>(image_token_id));
+    }
+    if (eoi_token_id > 0) {
+        tokens.push_back(static_cast<int32_t>(eoi_token_id));
+    }
+    if (gemma_tokenizer && gemma_tokenizer->get_eos_token_id() >= 0) {
+        tokens.push_back(static_cast<int32_t>(gemma_tokenizer->get_eos_token_id()));
+    }
+
+    // 3) 文本部分取词嵌入并乘 sqrt(hidden)，图像占位替换为视觉 soft token
+    const size_t seq_len = tokens.size();
+    std::vector<float> inputs_embeds = embedding_layer(tokens);
+    const float embed_scale = std::sqrt(static_cast<float>(text_hidden));
+    for (float& val : inputs_embeds) {
+        val *= embed_scale;
+    }
+    for (size_t i = 0; i < num_soft_tokens; ++i) {
+        const float* src = soft_tokens.data() + i * text_hidden;
+        float* dst = inputs_embeds.data() + (image_start + i) * text_hidden;
+        std::copy(src, src + text_hidden, dst);
+    }
+
+    // 4) 语言模型 + 均值池化 + L2
+    return embeddinggemma2_embeds_forward(inputs_embeds, seq_len);
+}
+
+std::vector<float> SentenceTransformerImpl::encode_image(const std::string& image_path) {
+    if (model_type != ModelType::EMBEDDING_GEMMA2 || !has_vision_tower) {
+        throw std::runtime_error("当前模型不支持图像编码（需要带视觉塔的 EmbeddingGemma2）");
+    }
+    GemmaImageInput image = load_and_preprocess_image(
+        image_path, static_cast<int>(vision_patch_size),
+        static_cast<int>(vision_max_patches), static_cast<int>(vision_pooling_kernel));
+    return embeddinggemma2_image_embedding(image);
+}
+
+std::vector<float> SentenceTransformerImpl::encode_image_bytes(const std::vector<uint8_t>& image_bytes) {
+    if (model_type != ModelType::EMBEDDING_GEMMA2 || !has_vision_tower) {
+        throw std::runtime_error("当前模型不支持图像编码（需要带视觉塔的 EmbeddingGemma2）");
+    }
+    if (image_bytes.empty()) {
+        throw std::runtime_error("图像数据为空");
+    }
+    int h = 0, w = 0;
+    std::vector<uint8_t> rgb = decode_image_rgb_from_memory(image_bytes.data(), image_bytes.size(), &h, &w);
+    GemmaImageInput image = preprocess_gemma_image(
+        rgb, h, w, static_cast<int>(vision_patch_size),
+        static_cast<int>(vision_max_patches), static_cast<int>(vision_pooling_kernel));
+    return embeddinggemma2_image_embedding(image);
+}
+
+bool SentenceTransformerImpl::supports_image() const {
+    return model_type == ModelType::EMBEDDING_GEMMA2 && has_vision_tower;
 }
 
 std::vector<float> SentenceTransformerImpl::encode(const std::string& text, const std::string& prompt_name) {

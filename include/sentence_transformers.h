@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <cstdint>
 
 // 前向声明实现类
 class SentenceTransformerImpl;
@@ -27,6 +28,13 @@ public:
 
     // 获取嵌入维度
     size_t get_embedding_dimension() const;
+
+    // 图像嵌入（需要带视觉塔的模型，如 EmbeddingGemma2）
+    std::vector<float> encode_image(const std::string& image_path);
+    std::vector<float> encode_image_bytes(const std::vector<uint8_t>& image_bytes);
+
+    // 当前模型是否支持图像编码
+    bool supports_image() const;
 
     // 获取模型内置的提示词名称列表
     std::vector<std::string> get_prompt_names() const;

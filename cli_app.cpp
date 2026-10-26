@@ -3,20 +3,62 @@
 #include <vector>
 #include <string>
 
-// 修改main函数以支持命令行参数和多轮输入
+namespace {
+
+void print_embedding(const std::vector<float>& embedding) {
+    std::cout << "embedding shape: " << embedding.size() << std::endl;
+    for (float val : embedding) {
+        std::cout << val << " ";
+    }
+    std::cout << "\n\n";
+}
+
+}  // namespace
+
+// 支持文本、提示词与图像三类输入
 int main(int argc, char* argv[]) {
     try {
-        // 命令行参数检查
-        if (argc != 2 && argc != 3) {
-            std::cerr << "Usage: " << argv[0] << " <model_path> [prompt_name]" << std::endl;
+        std::string model_path;
+        std::string prompt_name;
+        std::string image_path;
+
+        // 解析参数：位置参数为 <model_path> [prompt_name]，也支持 --image / --prompt
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--image" && i + 1 < argc) {
+                image_path = argv[++i];
+            } else if (arg == "--prompt" && i + 1 < argc) {
+                prompt_name = argv[++i];
+            } else if (model_path.empty()) {
+                model_path = arg;
+            } else if (prompt_name.empty()) {
+                prompt_name = arg;
+            }
+        }
+
+        if (model_path.empty()) {
+            std::cerr << "Usage: " << argv[0] << " <model_path> [prompt_name] [--image <image_path>]"
+                      << std::endl;
             return 1;
         }
 
         // 加载模型（仅加载一次）
-        std::string model_path = argv[1];
-        std::string prompt_name = (argc == 3) ? argv[2] : "";
         SentenceTransformer model(model_path);
-        std::cout << "模型加载成功，可开始输入文本（输入exit退出）...\n" << std::endl;
+
+        // 单次图像嵌入模式
+        if (!image_path.empty()) {
+            if (!model.supports_image()) {
+                std::cerr << "当前模型不支持图像编码（需要带视觉塔的 EmbeddingGemma2）" << std::endl;
+                return 1;
+            }
+            std::vector<float> embedding = model.encode_image(image_path);
+            std::cout << "图像: " << image_path << std::endl;
+            print_embedding(embedding);
+            return 0;
+        }
+
+        std::cout << "模型加载成功，可开始输入文本（输入 exit 退出，输入 @图片路径 编码图像）...\n"
+                  << std::endl;
 
         // 多轮输入循环
         std::string input_text;
@@ -37,16 +79,21 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
+            // "@路径" 直接编码图像
+            if (input_text[0] == '@') {
+                if (!model.supports_image()) {
+                    std::cerr << "当前模型不支持图像编码" << std::endl;
+                    continue;
+                }
+                std::vector<float> embedding = model.encode_image(input_text.substr(1));
+                print_embedding(embedding);
+                continue;
+            }
+
             // 处理单轮文本
             std::vector<std::string> texts = {input_text};
             std::vector<std::vector<float>> embeddings = model.encode_batch(texts, prompt_name);
-
-            // 输出结果
-            std::cout << "embedding shape: " << embeddings[0].size() << std::endl;
-            for (float val : embeddings[0]) {
-                std::cout << val << " ";
-            }
-            std::cout << "\n\n";
+            print_embedding(embeddings[0]);
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

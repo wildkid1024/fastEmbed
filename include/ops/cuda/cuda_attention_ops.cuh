@@ -2,6 +2,7 @@
 #define CUDA_ATTENTION_OPS_CUH
 
 #include <vector>
+#include <cstdint>
 
 class CUDAAttentionOps {
 public:
@@ -71,6 +72,29 @@ public:
         bool normalize_v,        // 是否对 V 做无权重 RMSNorm
         int sliding_window,      // <=0 表示全注意力；否则 |i-j| <= sliding_window
         float rms_eps            // RMSNorm 的 epsilon
+    );
+
+    // ========== 视觉塔（图像编码器）注意力 ==========
+    // 用于 Gemma4 / EmbeddingGemma2 的视觉塔：
+    //   1. Q/K 按 head 做带权 RMSNorm，V 做无权重 RMSNorm
+    //   2. 轴向 2D RoPE：前一半通道用 x 坐标、后一半用 y 坐标（每半内部再按 head_dim/4 频率成对旋转）
+    //   3. 双向注意力，padding patch 作为 key 被屏蔽，scale 由调用方给定（该模型为 1.0）
+    // 输入布局均为 [num_patches, num_heads * head_dim]
+    std::vector<float> vision_attention(
+        const std::vector<float>& q_input,        // [num_patches, num_q_heads * head_dim]
+        const std::vector<float>& k_input,        // [num_patches, num_kv_heads * head_dim]
+        const std::vector<float>& v_input,        // [num_patches, num_kv_heads * head_dim]
+        const std::vector<float>& q_norm_weight,  // [head_dim]
+        const std::vector<float>& k_norm_weight,  // [head_dim]
+        const std::vector<int32_t>& positions,    // [num_patches * 2]，(x, y)
+        const std::vector<uint8_t>& valid,        // [num_patches]，1=有效 patch
+        size_t num_patches,
+        size_t num_q_heads,
+        size_t num_kv_heads,
+        size_t head_dim,
+        float rope_theta,
+        float attn_scale,
+        float rms_eps
     );
 };
 

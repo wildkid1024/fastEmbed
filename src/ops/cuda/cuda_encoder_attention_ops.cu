@@ -229,6 +229,111 @@ __global__ void encoder_av_kernel(
     }
 }
 
+// 视觉塔的轴向 2D RoPE（in-place，仅用于 Q/K）：data [num_patches, num_heads * head_dim]
+// 频率按 head_dim/2 计算（每半 head_dim/4 个频率），前一半通道用 x 坐标、后一半用 y 坐标。
+__global__ void vision_axial_rope_kernel(
+    float* data,
+    const int* positions,   // [num_patches * 2] (x, y)
+    int num_patches,
+    int num_heads,
+    int head_dim,
+    float rope_theta
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = num_patches * num_heads;
+    if (idx >= total) return;
+
+    const int pos = idx / num_heads;
+    const int head = idx % num_heads;
+
+    const int quarter = head_dim / 4;     // 每半区内的频率个数
+    if (quarter <= 0) return;
+    const int spatial_dim = head_dim / 2;  // 频率分母的维度
+    const int part = head_dim / 2;         // 每半区的通道数
+
+    const long base = static_cast<long>(pos) * num_heads * head_dim +
+                      static_cast<long>(head) * head_dim;
+    const float x_pos = static_cast<float>(positions[pos * 2]);
+    const float y_pos = static_cast<float>(positions[pos * 2 + 1]);
+
+    for (int i = 0; i < quarter; ++i) {
+        const float inv_freq = 1.0f / powf(rope_theta, 2.0f * static_cast<float>(i) / static_cast<float>(spatial_dim));
+
+        // 半区 0：使用 x 坐标
+        const float theta_x = x_pos * inv_freq;
+        const float cos_x = cosf(theta_x);
+        const float sin_x = sinf(theta_x);
+        const float x0 = data[base + i];
+        const float x1 = data[base + i + quarter];
+        data[base + i] = x0 * cos_x - x1 * sin_x;
+        data[base + i + quarter] = x0 * sin_x + x1 * cos_x;
+
+        // 半区 1：使用 y 坐标
+        const float theta_y = y_pos * inv_freq;
+        const float cos_y = cosf(theta_y);
+        const float sin_y = sinf(theta_y);
+        const long base_y = base + part;
+        const float y0 = data[base_y + i];
+        const float y1 = data[base_y + i + quarter];
+        data[base_y + i] = y0 * cos_y - y1 * sin_y;
+        data[base_y + i + quarter] = y0 * sin_y + y1 * cos_y;
+    }
+}
+
+// 视觉塔 QK^T：padding patch 作为 key 时置为 -inf
+// blockIdx.x = 查询位置 i，blockIdx.y = 查询 head
+__global__ void vision_qk_kernel(
+    const float* q,        // [num_patches, num_q_heads * head_dim]
+    const float* k,        // [num_patches, num_kv_heads * head_dim]
+    float* scores,         // [num_q_heads, num_patches, num_patches]
+    const uint8_t* valid,  // [num_patches]
+    int num_patches,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float scale
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= num_patches || h >= num_q_heads) return;
+
+    const int group = num_q_heads / num_kv_heads;
+    const int kv_head = h / group;
+
+    __shared__ float reduce_buf[ENC_BLOCK_SIZE];
+
+    float* s_row = scores + (static_cast<long>(h) * num_patches + i) * num_patches;
+    const float* q_row = q + (static_cast<long>(i) * num_q_heads + h) * head_dim;
+
+    for (int j = threadIdx.x; j < num_patches; j += blockDim.x) {
+        s_row[j] = -1e30f;
+    }
+    __syncthreads();
+
+    for (int j = 0; j < num_patches; ++j) {
+        if (valid[j] == 0) continue;  // padding patch 不参与注意力
+        const float* k_row = k + (static_cast<long>(j) * num_kv_heads + kv_head) * head_dim;
+
+        float dot = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            dot += q_row[d] * k_row[d];
+        }
+
+        reduce_buf[threadIdx.x] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            s_row[j] = reduce_buf[0] * scale;
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 std::vector<float> CUDAAttentionOps::encoder_attention(
@@ -350,6 +455,141 @@ std::vector<float> CUDAAttentionOps::encoder_attention(
     CHECK_CUDA_ERROR_ENC(cudaFree(d_v));
     CHECK_CUDA_ERROR_ENC(cudaFree(d_out));
     CHECK_CUDA_ERROR_ENC(cudaFree(d_scores));
+    if (d_q_norm != nullptr) CHECK_CUDA_ERROR_ENC(cudaFree(d_q_norm));
+    if (d_k_norm != nullptr) CHECK_CUDA_ERROR_ENC(cudaFree(d_k_norm));
+
+    return output;
+}
+
+std::vector<float> CUDAAttentionOps::vision_attention(
+    const std::vector<float>& q_input,
+    const std::vector<float>& k_input,
+    const std::vector<float>& v_input,
+    const std::vector<float>& q_norm_weight,
+    const std::vector<float>& k_norm_weight,
+    const std::vector<int32_t>& positions,
+    const std::vector<uint8_t>& valid,
+    size_t num_patches,
+    size_t num_q_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    float rope_theta,
+    float attn_scale,
+    float rms_eps
+) {
+    if (num_patches == 0 || num_q_heads == 0 || num_kv_heads == 0 || head_dim == 0) {
+        throw std::invalid_argument("vision_attention: 非法维度参数");
+    }
+    const size_t q_stride = num_q_heads * head_dim;
+    const size_t kv_stride = num_kv_heads * head_dim;
+    if (q_input.size() != num_patches * q_stride ||
+        k_input.size() != num_patches * kv_stride ||
+        v_input.size() != num_patches * kv_stride ||
+        positions.size() != num_patches * 2 ||
+        valid.size() != num_patches) {
+        throw std::invalid_argument("vision_attention: 输入张量尺寸不匹配");
+    }
+
+    float* d_q = nullptr;
+    float* d_k = nullptr;
+    float* d_v = nullptr;
+    float* d_out = nullptr;
+    float* d_q_norm = nullptr;
+    float* d_k_norm = nullptr;
+    int* d_positions = nullptr;
+    uint8_t* d_valid = nullptr;
+
+    const size_t q_size = num_patches * q_stride * sizeof(float);
+    const size_t kv_size = num_patches * kv_stride * sizeof(float);
+
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_q, q_size));
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_k, kv_size));
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_v, kv_size));
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_out, q_size));
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_positions, positions.size() * sizeof(int32_t)));
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_valid, valid.size() * sizeof(uint8_t)));
+
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_q, q_input.data(), q_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_k, k_input.data(), kv_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_v, v_input.data(), kv_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_positions, positions.data(), positions.size() * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_valid, valid.data(), valid.size() * sizeof(uint8_t),
+                                    cudaMemcpyHostToDevice));
+
+    const int q_norm_blocks = static_cast<int>((num_patches * num_q_heads + ENC_BLOCK_SIZE - 1) / ENC_BLOCK_SIZE);
+    const int kv_norm_blocks = static_cast<int>((num_patches * num_kv_heads + ENC_BLOCK_SIZE - 1) / ENC_BLOCK_SIZE);
+
+    if (!q_norm_weight.empty()) {
+        CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_q_norm, head_dim * sizeof(float)));
+        CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_q_norm, q_norm_weight.data(), head_dim * sizeof(float),
+                                        cudaMemcpyHostToDevice));
+    }
+    if (!k_norm_weight.empty()) {
+        CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_k_norm, head_dim * sizeof(float)));
+        CHECK_CUDA_ERROR_ENC(cudaMemcpy(d_k_norm, k_norm_weight.data(), head_dim * sizeof(float),
+                                        cudaMemcpyHostToDevice));
+    }
+
+    encoder_rms_norm_head_kernel<<<q_norm_blocks, ENC_BLOCK_SIZE>>>(
+        d_q, d_q_norm, static_cast<int>(num_patches), static_cast<int>(num_q_heads),
+        static_cast<int>(head_dim), rms_eps, q_norm_weight.empty() ? 0 : 1);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    encoder_rms_norm_head_kernel<<<kv_norm_blocks, ENC_BLOCK_SIZE>>>(
+        d_k, d_k_norm, static_cast<int>(num_patches), static_cast<int>(num_kv_heads),
+        static_cast<int>(head_dim), rms_eps, k_norm_weight.empty() ? 0 : 1);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    // V 的无权重 RMSNorm
+    encoder_rms_norm_head_kernel<<<kv_norm_blocks, ENC_BLOCK_SIZE>>>(
+        d_v, nullptr, static_cast<int>(num_patches), static_cast<int>(num_kv_heads),
+        static_cast<int>(head_dim), rms_eps, 0);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    // 轴向 2D RoPE（仅 Q/K）
+    vision_axial_rope_kernel<<<q_norm_blocks, ENC_BLOCK_SIZE>>>(
+        d_q, d_positions, static_cast<int>(num_patches), static_cast<int>(num_q_heads),
+        static_cast<int>(head_dim), rope_theta);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    vision_axial_rope_kernel<<<kv_norm_blocks, ENC_BLOCK_SIZE>>>(
+        d_k, d_positions, static_cast<int>(num_patches), static_cast<int>(num_kv_heads),
+        static_cast<int>(head_dim), rope_theta);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    float* d_scores = nullptr;
+    const size_t scores_size = num_q_heads * num_patches * num_patches * sizeof(float);
+    CHECK_CUDA_ERROR_ENC(cudaMalloc(&d_scores, scores_size));
+
+    dim3 attn_grid(static_cast<unsigned int>(num_patches), static_cast<unsigned int>(num_q_heads));
+    vision_qk_kernel<<<attn_grid, ENC_BLOCK_SIZE>>>(
+        d_q, d_k, d_scores, d_valid,
+        static_cast<int>(num_patches), static_cast<int>(num_q_heads),
+        static_cast<int>(num_kv_heads), static_cast<int>(head_dim), attn_scale);
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    const int softmax_blocks = static_cast<int>(num_q_heads * num_patches);
+    encoder_softmax_kernel<<<softmax_blocks, ENC_BLOCK_SIZE>>>(d_scores, static_cast<int>(num_patches));
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+
+    encoder_av_kernel<<<attn_grid, ENC_BLOCK_SIZE>>>(
+        d_scores, d_v, d_out,
+        static_cast<int>(num_patches), static_cast<int>(num_q_heads),
+        static_cast<int>(num_kv_heads), static_cast<int>(head_dim));
+    CHECK_CUDA_ERROR_ENC(cudaGetLastError());
+    CHECK_CUDA_ERROR_ENC(cudaDeviceSynchronize());
+
+    std::vector<float> output(num_patches * q_stride);
+    CHECK_CUDA_ERROR_ENC(cudaMemcpy(output.data(), d_out, q_size, cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_q));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_k));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_v));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_out));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_scores));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_positions));
+    CHECK_CUDA_ERROR_ENC(cudaFree(d_valid));
     if (d_q_norm != nullptr) CHECK_CUDA_ERROR_ENC(cudaFree(d_q_norm));
     if (d_k_norm != nullptr) CHECK_CUDA_ERROR_ENC(cudaFree(d_k_norm));
 

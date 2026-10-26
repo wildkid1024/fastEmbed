@@ -1,6 +1,7 @@
 #include <crow.h>
 #include "sentence_transformers.h"
 #include "tokenizer.h"
+#include "image_processor.h"  // base64_decode / 图像预处理
 #include <nlohmann/json.hpp>
 #include <cstring>
 #include <string>
@@ -172,12 +173,61 @@ int main(int argc, char* argv[]) {
             res.end();
         });
 
+        // 图像嵌入端点（需要带视觉塔的模型，如 EmbeddingGemma2）
+        // 支持两种入参：{"image": "<本地路径>"} 或 {"image_base64": "<base64 / data URI>"}
+        const std::string image_route = api_prefix + "/image_embedding";
+        auto& image_endpoint = app.route_dynamic(image_route);
+        image_endpoint.methods(crow::HTTPMethod::POST)
+        ([&](const crow::request& req, crow::response& res) {
+            add_cors_headers(res);
+            try {
+                nlohmann::json req_json = nlohmann::json::parse(req.body);
+                if (!model.supports_image()) {
+                    res.code = 400;
+                    res.body = R"({"error": "current model does not support image encoding"})";
+                    res.end();
+                    return;
+                }
+
+                std::vector<float> embedding;
+                if (req_json.contains("image_base64") && req_json["image_base64"].is_string()) {
+                    const std::string encoded = req_json["image_base64"].get<std::string>();
+                    const std::vector<uint8_t> bytes = base64_decode(encoded);
+                    if (bytes.empty()) {
+                        res.code = 400;
+                        res.body = R"({"error": "invalid base64 image data"})";
+                        res.end();
+                        return;
+                    }
+                    embedding = model.encode_image_bytes(bytes);
+                } else if (req_json.contains("image") && req_json["image"].is_string()) {
+                    embedding = model.encode_image(req_json["image"].get<std::string>());
+                } else {
+                    res.code = 400;
+                    res.body = R"({"error": "Missing 'image' (path) or 'image_base64' field"})";
+                    res.end();
+                    return;
+                }
+
+                nlohmann::json res_json;
+                res_json["embedding"] = embedding;
+                res_json["model"] = serve_model_name;
+                res.body = res_json.dump();
+                res.code = 200;
+            } catch (const std::exception& e) {
+                res.code = 500;
+                res.body = R"({"error": ")" + std::string(e.what()) + R"("})";
+            }
+            res.end();
+        });
+
         // Start the server
         std::cout << "Starting server on port " << server_port << "..." << std::endl;
         std::cout << "Available endpoints:" << std::endl;
         std::cout << "  - " << health_route << " (GET, Health Check)" << std::endl;
         std::cout << "  - " << embed_route << " (POST, Simple Embedding)" << std::endl;
         std::cout << "  - " << openai_route << " (POST, OpenAI Compatible Embedding)" << std::endl;
+        std::cout << "  - " << image_route << " (POST, Image Embedding)" << std::endl;
         app.port(server_port).multithreaded().run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -6,6 +6,7 @@
 #include <sentencepiece_processor.h>
 #include <nlohmann/json.hpp>
 #include "tokenizer.h"  // 引入 tokenizer 头文件
+#include "image_processor.h"  // 图像预处理（Gemma4 patchify）
 
 // 移除未使用的CPU头文件
 #include "ops/cpu/cpu_attention_ops.h"
@@ -40,6 +41,24 @@ private:
     nlohmann::json text_config;  // 文本塔配置（多模态模型的 text_config，其它模型等于 config）
     std::vector<std::string> layer_types;   // 逐层注意力类型（full_attention / sliding_attention）
     std::unordered_map<std::string, std::string> prompts;  // 提示词前缀（config_sentence_transformers.json）
+
+    // ===== 视觉塔（图像编码器）相关配置，仅 EmbeddingGemma2 使用 =====
+    nlohmann::json vision_config;
+    bool has_vision_tower = false;      // 权重中是否存在 vision_tower.*
+    size_t vision_hidden_size = 0;
+    size_t vision_num_layers = 0;
+    size_t vision_num_heads = 0;
+    size_t vision_num_kv_heads = 0;
+    size_t vision_head_dim = 0;
+    size_t vision_intermediate_size = 0;
+    size_t vision_patch_size = 0;
+    size_t vision_max_patches = 0;      // max_soft_tokens * pooling^2
+    size_t vision_pooling_kernel = 0;
+    float vision_rope_theta = 100.0f;
+    float vision_eps = 1e-6f;
+    size_t image_token_id = 0;
+    size_t boi_token_id = 0;
+    size_t eoi_token_id = 0;
     // 注释掉未使用的CPU实例
     CPUAttentionOps cpu_attention_ops; 
     CPUMatrixOps cpu_matrix_ops; 
@@ -83,6 +102,12 @@ private:
     std::vector<std::vector<int32_t>> tokenize_batch(const std::vector<std::string>& texts);
     std::vector<std::vector<float>> qwen3_forward_batch(const std::vector<std::vector<int32_t>>& tokens_list);
     std::vector<std::vector<float>> embeddinggemma2_forward_batch(const std::vector<std::vector<int32_t>>& tokens_list);
+    // 已经拿到 inputs_embeds 时的语言模型前向（图像 soft token 会先拼进来）
+    std::vector<float> embeddinggemma2_embeds_forward(const std::vector<float>& inputs_embeds, size_t seq_len);
+    // 视觉塔前向：patch -> 16 层编码 -> 3x3 池化 -> 投影到文本空间，输出 [num_soft_tokens, text_hidden]
+    std::vector<float> embeddinggemma2_vision_forward(const GemmaImageInput& image);
+    // 图像 -> 与文本同空间的嵌入（视觉 soft token 拼进序列后过语言模型 + 均值池化 + L2）
+    std::vector<float> embeddinggemma2_image_embedding(const GemmaImageInput& image);
     // 为文本添加提示词前缀（EmbeddingGemma 系列的 query/document 前缀）
     std::string apply_prompt(const std::string& text, const std::string& prompt_name) const;
 
@@ -91,6 +116,12 @@ public:
     SentenceTransformerImpl(const std::string& model_path, const std::string& tokenizer_path);
      std::vector<float> encode(const std::string& text, const std::string& prompt_name = "");
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts, const std::string& prompt_name = "");
+    // 图像嵌入（当前支持 EmbeddingGemma2 的视觉塔），输出与文本嵌入同维度同空间
+    std::vector<float> encode_image(const std::string& image_path);
+    // 从内存字节（PNG/JPEG 等）编码图像，便于 HTTP 直接传 base64
+    std::vector<float> encode_image_bytes(const std::vector<uint8_t>& image_bytes);
+    // 是否支持图像编码
+    bool supports_image() const;
     size_t get_embedding_dimension() const;
     // 模型内置的提示词名称列表（如 query / document / STS ...）
     std::vector<std::string> get_prompt_names() const;

@@ -10,6 +10,7 @@ fastEmbed 是一个高性能文本嵌入（Text Embedding）推理框架，采�
 - **纯 C++/CUDA 实现**：直接对接底层硬件加速，支持 GPU 批量推理
 - **隐私保护**：支持完全离线运行，数据无需上传云端
 - **多模型支持**：内置 BGE 系列、Qwen3-Embedding 系列和 EmbeddingGemma 2
+- **图文同空间**：实现 EmbeddingGemma 2 的视觉塔（Gemma4 Vision），图像可直接编码到与文本相同的向量空间，支持以图搜文、以文搜图
 
 ## 快速开始
 
@@ -41,7 +42,7 @@ make -j
 | BGE | bge-large-zh-v1.5 | 中文 | 1024 | 512 | 高精度中文理解 |
 | BGE | bge-m3 | 多语言 | 1024 | 512 | 多语言、多粒度检索 |
 | Qwen3 | Qwen3-Embedding-0.6B | 中英双语 | 1024 | 8192 | 长文档理解、复杂推理 |
-| EmbeddingGemma | embeddinggemma-2 | 多语言（文本塔） | 768 | 2048 | 高精度多语言检索、可截断维度 |
+| EmbeddingGemma | embeddinggemma-2 | 多语言（文本 + 图像） | 768 | 2048 | 高精度多语言检索、图文跨模态检索、可截断维度 |
 
 > EmbeddingGemma 2 说明：
 > - 纯 C++/CUDA 复刻了官方 `EmbeddingGemma2Model` 的**文本塔**（24 层双向编码器 + PLE 每层输入 + `gelu_pytorch_tanh` MLP），输出 768 维，均值池化后 L2 归一化；
@@ -175,9 +176,47 @@ fastEmbed 还提供命令行工具用于快速测试：
 # 交互式输入
 echo "Hello World" | ./build/cli ./models/bge-m3
 
-# 查看帮助
-./build/cli --help
+# 单张图片编码
+./build/cli ./models/embeddinggemma-2 --image ./test.jpg
+
+# 交互模式下输入 @路径 也可以编码图片
+./build/cli ./models/embeddinggemma-2
+# 请输入文本: @./test.jpg
 ```
+
+#### 图像嵌入（EmbeddingGemma 2 视觉塔）
+
+EmbeddingGemma 2 自带视觉塔（Gemma4 Vision，16 层 / 768 隐层 / patch 16），图像经过视觉塔后
+以 280 个以内的 soft token 拼进语言模型输入序列，最终文本与图像落在同一个 768 维空间，
+余弦相似度可直接跨模态比较。
+
+图像预处理与官方 `Gemma4ImageProcessor` 保持一致：等比缩放到 48 的整数倍、最多 2520 个 patch、
+像素 `/255`（不做 mean/std 归一化）、按 16×16 patchify 并携带 (x, y) 位置 id。
+
+```bash
+# 传本地路径
+curl -X POST http://localhost:8080/image_embedding \
+  -H "Content-Type: application/json" \
+  -d '{"image": "./test.jpg"}'
+
+# 传 base64（也支持 data URI 前缀）
+curl -X POST http://localhost:8080/image_embedding \
+  -H "Content-Type: application/json" \
+  -d "{\"image_base64\": \"$(base64 -w0 test.jpg)\"}"
+```
+
+```cpp
+SentenceTransformer model("./models/embeddinggemma-2");
+auto img_emb = model.encode_image("./test.jpg");                 // 路径
+auto img_emb2 = model.encode_image_bytes(jpeg_bytes);           // 内存字节
+auto text_emb = model.encode("一张关于北极光的照片", "SearchQuery");
+
+// 同一个向量空间，可直接算相似度
+float sim = cosine(img_emb, text_emb);
+```
+
+说明：图像编码只支持带视觉塔的模型（当前为 EmbeddingGemma 2）；不支持时
+`supports_image()` 返回 false，HTTP 端点会返回 400。
 
 ## 应用场景
 
