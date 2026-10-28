@@ -1,4 +1,5 @@
 #include "ops/cuda/cuda_attention_ops.cuh"
+#include "ops/cuda/device_weight_cache.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <cmath>
@@ -318,32 +319,28 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
 
     // Device pointers
     float *d_input, *d_q, *d_k, *d_v, *d_output;
-    float *d_wq, *d_wk, *d_wv, *d_bq, *d_bk, *d_bv;
+    const float *d_wq, *d_wk, *d_wv, *d_bq, *d_bk, *d_bv;
     const size_t input_size = input.size() * sizeof(float);
-    const size_t weight_size = weight_q.size() * sizeof(float);
-    const size_t bias_size = query_bias.size() * sizeof(float);
 
     // Allocate device memory
     CHECK_CUDA_ERROR(cudaMalloc(&d_input, input_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_wq, weight_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_wk, weight_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_wv, weight_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_bq, bias_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_bk, bias_size));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_bv, bias_size));
     CHECK_CUDA_ERROR(cudaMalloc(&d_q, batch_size * seq_len * embedding_dim * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_k, batch_size * seq_len * embedding_dim * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_v, batch_size * seq_len * embedding_dim * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_output, input_size));
 
+    // 权重/偏置：走设备端常驻缓存，不再每层每请求重新上传
+    // （BGE-large 每层 q/k/v 各 16MB，此前每请求要搬运 1GB+ 权重）
+    DeviceWeightCache& weight_cache = DeviceWeightCache::instance();
+    d_wq = weight_cache.get(weight_q.data(), weight_q.size());
+    d_wk = weight_cache.get(weight_k.data(), weight_k.size());
+    d_wv = weight_cache.get(weight_v.data(), weight_v.size());
+    d_bq = weight_cache.get(query_bias.data(), query_bias.size());
+    d_bk = weight_cache.get(key_bias.data(), key_bias.size());
+    d_bv = weight_cache.get(value_bias.data(), value_bias.size());
+
     // Copy data to device
     CHECK_CUDA_ERROR(cudaMemcpy(d_input, input.data(), input_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_wq, weight_q.data(), weight_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_wk, weight_k.data(), weight_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_wv, weight_v.data(), weight_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_bq, query_bias.data(), bias_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_bk, key_bias.data(), bias_size, cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_bv, value_bias.data(), bias_size, cudaMemcpyHostToDevice));
 
     // 矩阵乘法参数
     const float alpha = 1.0f;
@@ -434,10 +431,6 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
     );
     CHECK_CUDA_ERROR(cudaGetLastError());
 
-    // 打印attn_output以调试
-    std::vector<float> attn_output(batch_size * num_heads * seq_len * head_dim);
-    CHECK_CUDA_ERROR(cudaMemcpy(attn_output.data(), d_attn_output, batch_size * num_heads * seq_len * head_dim * sizeof(float), cudaMemcpyDeviceToHost));
-
     // 恢复原始维度
     unpermute_kernel<<<permute_grid_size, permute_block_size>>>(d_attn_output, d_output, batch_size, seq_len, num_heads, head_dim);
     CHECK_CUDA_ERROR(cudaGetLastError());
@@ -450,19 +443,12 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
     CHECK_CUDA_ERROR(cudaFree(d_preatt));
     CHECK_CUDA_ERROR(cudaFree(d_attn_output));
 
-    // 修复output_size未定义的错误
     // 拷贝结果回主机
     std::vector<float> output(input.size());
     CHECK_CUDA_ERROR(cudaMemcpy(output.data(), d_output, input_size, cudaMemcpyDeviceToHost));
 
-    // 清理所有设备内存
+    // 清理设备内存（d_wq/d_wk/d_wv/d_bq/d_bk/d_bv 为常驻缓存指针，不能释放）
     CHECK_CUDA_ERROR(cudaFree(d_input));
-    CHECK_CUDA_ERROR(cudaFree(d_wq));
-    CHECK_CUDA_ERROR(cudaFree(d_wk));
-    CHECK_CUDA_ERROR(cudaFree(d_wv));
-    CHECK_CUDA_ERROR(cudaFree(d_bq));
-    CHECK_CUDA_ERROR(cudaFree(d_bk));
-    CHECK_CUDA_ERROR(cudaFree(d_bv));
     CHECK_CUDA_ERROR(cudaFree(d_q));
     CHECK_CUDA_ERROR(cudaFree(d_k));
     CHECK_CUDA_ERROR(cudaFree(d_v));

@@ -81,6 +81,8 @@ if(USE_CUDA)
 else()
     # 仅查找非 CUDA 相关的 C++ 源文件
     file(GLOB_RECURSE CPP_SOURCES "src/*.cpp" "src/ops/cpu/*.cpp")
+    # 排除依赖 CUDA runtime 的源文件（如 device_weight_cache.cpp）
+    list(FILTER CPP_SOURCES EXCLUDE REGEX "src/ops/cuda/.*")
     # list(FILTER CPP_SOURCES EXCLUDE REGEX "src/ops/cpu/.*\\.cpp")
 
     # Include directories

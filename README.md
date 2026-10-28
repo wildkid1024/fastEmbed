@@ -7,6 +7,7 @@ fastEmbed 是一个高性能文本嵌入（Text Embedding）推理框架，采�
 - **原生模型加载**：直接读取 HuggingFace 原始模型文件（safetensors/bin 格式），无需任何格式转换
 - **一键服务部署**：单命令启动 HTTP 服务，提供 OpenAI 兼容的 API 接口
 - **极致轻量化**：编译后二进制文件仅约 2MB，无 Python 依赖
+- **低延迟**：权重常驻显存，端到端延迟近似随 token 数线性增长（0.3B 模型 60 token 约 210 ms @ RTX 2070），详见[性能基准](#性能基准)
 - **纯 C++/CUDA 实现**：直接对接底层硬件加速，支持 GPU 批量推理
 - **隐私保护**：支持完全离线运行，数据无需上传云端
 - **多模型支持**：内置 BGE 系列、Qwen3-Embedding 系列和 EmbeddingGemma 2
@@ -48,7 +49,7 @@ make -j
 > - 纯 C++/CUDA 复刻了官方 `EmbeddingGemma2Model` 的**文本塔**（24 层双向编码器 + PLE 每层输入 + `gelu_pytorch_tanh` MLP），输出 768 维，均值池化后 L2 归一化；
 > - 支持官方内置的 20 个任务提示词（`query` / `Document` / `SearchQuery` / `STS` …），通过 `prompt_name` 参数启用；
 > - 支持 Matryoshka 维度截断，客户端取前 768/512/256/128 维后**需重新归一化**（本服务默认返回完整 768 维并已归一化）；
-> - 视觉/音频塔尚未实现，本服务仅支持文本输入。
+> - 视觉塔已实现（Gemma4 Vision，16 层 + 2D 轴向 RoPE），图像经 `encode_image` / `/image_embedding` 编码后与文本处于同一向量空间；音频塔尚未实现。
 
 ### 系统要求
 
@@ -217,6 +218,68 @@ float sim = cosine(img_emb, text_emb);
 
 说明：图像编码只支持带视觉塔的模型（当前为 EmbeddingGemma 2）；不支持时
 `supports_image()` 返回 false，HTTP 端点会返回 400。
+
+## 性能基准
+
+**测试环境**：NVIDIA GeForce RTX 2070 8GB · 驱动 615.78.08 · CUDA 12.6 · FP32 推理 · 单实例、串行请求
+
+**测量方式**：HTTP 端到端延迟（`POST /v1/embeddings`），每档预热 3 次后采样 10 次取中位数；
+token 数由模型自带的 tokenizer 精确统计，不是估算值
+
+**复测脚本**：`scripts/bench_http.py`（随仓库提供，见文末命令）
+
+### 端到端延迟（median，单位 ms）
+
+| 模型 | 维度 | 短文本 | 30 tok | 60 tok | 128 tok |
+|---|---:|---:|---:|---:|---:|
+| embeddinggemma-2（0.3B） | 768 | 49（12 tok） | 107 | 212 | 440 |
+| bge-large-zh-v1.5（0.33B） | 1024 | 157（21 tok） | 211 | 409 | 853 |
+| Qwen3-Embedding-0.6B（0.6B） | 1024 | 168（12 tok） | 424 | 752 | 1448 |
+
+> 短文本列括号内为实际 token 数——不同 tokenizer 对同一句英文的切分不同，故各模型起点略有差异。
+
+### 固定开销与边际成本
+
+对上面的中位数做线性拟合（延迟 = 固定开销 + 每 token 成本 × token 数）：
+
+| 模型 | 固定开销（截距） | 每 token 边际成本 |
+|---|---:|---:|
+| embeddinggemma-2 | 8.6 ms | 3.37 ms |
+| bge-large-zh-v1.5 | 18.4 ms | 6.52 ms |
+| Qwen3-Embedding-0.6B | 72.4 ms | 10.87 ms |
+
+两个参数的含义：
+
+- **固定开销**只与模型规模/层数有关，与输入长度无关。权重在首次请求时上传并**常驻显存**，此后每个请求
+  不再搬运权重（否则 0.6B 模型每请求要多付约 290 ms 的 PCIe 时间），剩下的开销来自激活值拷贝与算子同步。
+- **每 token 边际成本**是纯计算成本。在上表三个模型的 60 token 请求中，87%–96% 的耗时都在这里。
+
+> 作为参照：权重常驻显存改造之前，Qwen3-Embedding-0.6B 在 60 token 上为 3824 ms、30 token 为 2045 ms，
+> 固定开销约 293 ms，瓶颈完全在每请求的权重搬运上。改造后同一指标的对应值为 752 ms / 424 ms / 72 ms。
+
+### 使用时的两个注意点
+
+1. **一张卡只跑一个实例**。多个模型实例共驻同一张显卡时，延迟会被显著放大：实测 embeddinggemma-2
+   在 30 token 上从独占的 107 ms 升到 303 ms（2.8 倍），因为每个请求要发起两百余次 kernel launch，
+   两个进程在同卡上互相争抢。需要多模型同时在线时，建议按卡分配或排队。
+2. **当前版本优化的是单请求延迟，不是吞吐**。GEMM 仍为 FP32 实现，尚未启用 Tensor Core 与请求级
+   batching。低并发、对首字延迟敏感的场景（本地 RAG、端侧、离线批处理）是它擅长的区间；高 QPS 压测
+   数据会随 batching 支持一并补齐，不做超前承诺。
+
+### 复测命令
+
+```bash
+# 依赖：pip install tokenizers（仅压测脚本需要，服务本身不依赖 Python）
+# 在能访问服务端口、且能读到 tokenizer.json 的环境里执行
+python3 scripts/bench_http.py \
+  --port 8080 \
+  --model embeddinggemma-2 \
+  --tokenizer /path/to/embeddinggemma-2/tokenizer.json \
+  --levels 5,15,30,60,128 --reps 10
+```
+
+脚本会输出上表的全部列，并顺带给出该模型的固定开销与每 token 边际成本。
+完整的测试记录（含改动前后对比与共卡干扰的实测）见 `PERFORMANCE_WEIGHT_CACHE_20261028.md`。
 
 ## 应用场景
 

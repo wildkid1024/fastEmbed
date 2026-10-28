@@ -1,5 +1,9 @@
 build/
+build-cuda/
 .venv/
 __pycache__/
 *.pyc
 .workbuddy/
+
+# 本地对比报告：性能追平前不对外公开
+PERFORMANCE_TORCH_COMPARISON_*.md

@@ -1,4 +1,5 @@
 #include "ops/cuda/cuda_matrix_ops.h"
+#include "ops/cuda/device_weight_cache.h"
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
@@ -50,7 +51,10 @@ __global__ void matrix_multiply_transpose_kernel(const float* A, const float* B,
 
 // ========== 批量版本的 CUDA kernels ==========
 
-// 批量转置矩阵乘法核函数 (C[b, m, k] = A[b, m, n] * B[b, k, n]^T)
+// 批量转置矩阵乘法核函数（权重广播版）
+// C[b, m, k] = A[b, m, n] * B[k, n]^T
+// B 是所有 batch 共享的同一份权重（此前为每个 batch 元素复制一份，
+// batch=8 时权重 PCIe 流量放大 8 倍），现在只上传/驻留一份
 __global__ void matrix_multiply_transpose_batch_kernel(
     const float* A, const float* B, float* C,
     int batch, int m, int n, int k
@@ -62,7 +66,7 @@ __global__ void matrix_multiply_transpose_batch_kernel(
     if (b < batch && row < m && col < k) {
         float sum = 0.0f;
         for (int i = 0; i < n; ++i) {
-            sum += A[b * m * n + row * n + i] * B[b * k * n + col * n + i];
+            sum += A[b * m * n + row * n + i] * B[col * n + i];
         }
         C[b * m * k + row * k + col] = sum;
     }
@@ -277,24 +281,27 @@ std::vector<float> CUDAMatrixOps::matrix_multiply(const std::vector<float>& a, c
 }
 
 std::vector<float> CUDAMatrixOps::matrix_multiply_transpose(const std::vector<float>& a, const std::vector<float>& b,
-                                                           size_t m, size_t n, size_t k) {
+                                                            size_t m, size_t n, size_t k) {
     size_t a_size = m * n;
-    size_t b_size = n * k;
     size_t result_size = m * k;
-    size_t required_size = std::max({a_size, b_size, result_size});
+    // b 是权重矩阵：走设备端常驻缓存，不再每次 cudaMemcpy（此前每请求
+    // 会把全部权重搬运一遍，约 1.76GB / 次，是短文本 300ms 延迟的主因）
+    size_t required_size = std::max({a_size, result_size});
 
     ensure_memory(required_size);
 
-    // 复制数据到设备
+    // 复制激活数据到设备
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, a.data(), a_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, b.data(), b_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // 权重：首次使用时上传并常驻，之后直接复用设备指针
+    const float* d_weight = DeviceWeightCache::instance().get(b.data(), b.size());
 
     // 配置核函数网格和块
     dim3 blockDim(16, 16);
     dim3 gridDim((k + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y);
 
     // 启动核函数
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_result, m, n, k);
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_weight, d_result, m, n, k);
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
@@ -735,35 +742,38 @@ std::vector<float> CUDAMatrixOps::mlp_fused(
     size_t intermediate_total = seq_len * intermediate_size;
     size_t output_size = seq_len * hidden_size;
     
-    // 计算所需的最大显存
-    size_t max_size = std::max({input_size, gate_weight.size(), up_weight.size(), 
-                                down_weight.size(), intermediate_total, output_size});
-    
+    // 三个权重走设备端常驻缓存，暂存区只需覆盖激活/中间结果
+    size_t max_size = std::max({input_size, intermediate_total, output_size});
+
     // 使用ensure_memory确保基础缓冲区足够大
     ensure_memory(max_size);
-    
+
     // 分配额外的中间结果缓冲区
     float *d_gate_output, *d_up_output, *d_gate_up;
     CHECK_CUDA_ERROR(cudaMalloc(&d_gate_output, intermediate_total * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_up_output, intermediate_total * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_gate_up, intermediate_total * sizeof(float)));
-    
-    // 复制输入数据到GPU (复用d_a, d_b)
+
+    // 权重：首次使用时上传并常驻，之后直接复用设备指针
+    DeviceWeightCache& weight_cache = DeviceWeightCache::instance();
+    const float* d_gate_weight = weight_cache.get(gate_weight.data(), gate_weight.size());
+    const float* d_up_weight = weight_cache.get(up_weight.data(), up_weight.size());
+    const float* d_down_weight = weight_cache.get(down_weight.data(), down_weight.size());
+
+    // 复制输入数据到GPU (复用d_a)
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, input.data(), input_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, gate_weight.data(), gate_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
-    
+
     // Step 1: gate_proj = input × gate_weight^T [seq_len, hidden_size] × [hidden_size, intermediate_size]^T
     dim3 blockDim(16, 16);
     dim3 gridDim(
         (intermediate_size + blockDim.x - 1) / blockDim.x,
         (seq_len + blockDim.y - 1) / blockDim.y
     );
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_gate_output, seq_len, hidden_size, intermediate_size);
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_gate_weight, d_gate_output, seq_len, hidden_size, intermediate_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
-    
-    // Step 2: up_proj = input × up_weight^T (复用d_b存储up_weight)
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, up_weight.data(), up_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_up_output, seq_len, hidden_size, intermediate_size);
+
+    // Step 2: up_proj = input × up_weight^T
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_up_weight, d_up_output, seq_len, hidden_size, intermediate_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
     
     // Step 3: SiLU(gate_output) * up_output
@@ -772,26 +782,25 @@ std::vector<float> CUDAMatrixOps::mlp_fused(
     silu_multiply_kernel<<<siluGridSize, siluBlockSize>>>(d_gate_output, d_up_output, d_gate_up, intermediate_total);
     CHECK_CUDA_ERROR(cudaGetLastError());
     
-    // Step 4: down_proj = gate_up × down_weight^T (复用d_b存储down_weight, d_result存储输出)
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, down_weight.data(), down_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
+    // Step 4: down_proj = gate_up × down_weight^T (d_result存储输出)
     dim3 downBlockDim(16, 16);
     dim3 downGridDim(
         (hidden_size + downBlockDim.x - 1) / downBlockDim.x,
         (seq_len + downBlockDim.y - 1) / downBlockDim.y
     );
-    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_b, d_result, seq_len, intermediate_size, hidden_size);
+    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_down_weight, d_result, seq_len, intermediate_size, hidden_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-    
+
     // 复制结果回主机
     std::vector<float> result(output_size);
     CHECK_CUDA_ERROR(cudaMemcpy(result.data(), d_result, output_size * sizeof(float), cudaMemcpyDeviceToHost));
-    
+
     // 释放额外的GPU内存
     CHECK_CUDA_ERROR(cudaFree(d_gate_output));
     CHECK_CUDA_ERROR(cudaFree(d_up_output));
     CHECK_CUDA_ERROR(cudaFree(d_gate_up));
-    
+
     return result;
 }
 
@@ -821,8 +830,8 @@ std::vector<float> CUDAMatrixOps::mlp_fused_gelu(
     size_t intermediate_total = seq_len * intermediate_size;
     size_t output_size = seq_len * hidden_size;
 
-    size_t max_size = std::max({input_size, gate_weight.size(), up_weight.size(),
-                                down_weight.size(), intermediate_total, output_size});
+    // 三个权重走设备端常驻缓存，暂存区只需覆盖激活/中间结果
+    size_t max_size = std::max({input_size, intermediate_total, output_size});
 
     ensure_memory(max_size);
 
@@ -831,21 +840,25 @@ std::vector<float> CUDAMatrixOps::mlp_fused_gelu(
     CHECK_CUDA_ERROR(cudaMalloc(&d_up_output, intermediate_total * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_gate_up, intermediate_total * sizeof(float)));
 
+    // 权重：首次使用时上传并常驻
+    DeviceWeightCache& weight_cache = DeviceWeightCache::instance();
+    const float* d_gate_weight = weight_cache.get(gate_weight.data(), gate_weight.size());
+    const float* d_up_weight = weight_cache.get(up_weight.data(), up_weight.size());
+    const float* d_down_weight = weight_cache.get(down_weight.data(), down_weight.size());
+
     // Step 1: gate_proj = input × gate_weight^T
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, input.data(), input_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, gate_weight.data(), gate_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     dim3 blockDim(16, 16);
     dim3 gridDim(
         (intermediate_size + blockDim.x - 1) / blockDim.x,
         (seq_len + blockDim.y - 1) / blockDim.y
     );
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_gate_output, seq_len, hidden_size, intermediate_size);
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_gate_weight, d_gate_output, seq_len, hidden_size, intermediate_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
 
     // Step 2: up_proj = input × up_weight^T
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, up_weight.data(), up_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_up_output, seq_len, hidden_size, intermediate_size);
+    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_up_weight, d_up_output, seq_len, hidden_size, intermediate_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
 
     // Step 3: GELU-tanh(gate_output) * up_output
@@ -855,13 +868,12 @@ std::vector<float> CUDAMatrixOps::mlp_fused_gelu(
     CHECK_CUDA_ERROR(cudaGetLastError());
 
     // Step 4: down_proj = gate_up × down_weight^T
-    CHECK_CUDA_ERROR(cudaMemcpy(d_b, down_weight.data(), down_weight.size() * sizeof(float), cudaMemcpyHostToDevice));
     dim3 downBlockDim(16, 16);
     dim3 downGridDim(
         (hidden_size + downBlockDim.x - 1) / downBlockDim.x,
         (seq_len + downBlockDim.y - 1) / downBlockDim.y
     );
-    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_b, d_result, seq_len, intermediate_size, hidden_size);
+    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_down_weight, d_result, seq_len, intermediate_size, hidden_size);
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
@@ -884,28 +896,24 @@ std::vector<float> CUDAMatrixOps::matrix_multiply_transpose_batch(
 ) {
     size_t result_size = batch_size * m * k;
     std::vector<float> result(result_size);
-    
-    // 分配 GPU 内存
+
+    // 分配 GPU 内存（B 是全 batch 共享的权重，只占一份，走常驻缓存）
     float* d_a = nullptr;
-    float* d_b = nullptr;
     float* d_result = nullptr;
-    
+
     CHECK_CUDA_ERROR(cudaMalloc(&d_a, batch_size * m * n * sizeof(float)));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_b, batch_size * k * n * sizeof(float)));
     CHECK_CUDA_ERROR(cudaMalloc(&d_result, result_size * sizeof(float)));
-    
-    // 复制数据到设备
+
+    // 复制激活数据到设备
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, a.data(), batch_size * m * n * sizeof(float), cudaMemcpyHostToDevice));
-    
-    // 为每个批次复制相同的权重 b
-    for (size_t b_idx = 0; b_idx < batch_size; ++b_idx) {
-        CHECK_CUDA_ERROR(cudaMemcpy(d_b + b_idx * k * n, b.data(), k * n * sizeof(float), cudaMemcpyHostToDevice));
-    }
-    
+
+    // 权重：首次使用时上传并常驻，所有 batch 元素共享同一份
+    const float* d_b = DeviceWeightCache::instance().get(b.data(), b.size());
+
     // 配置核函数网格和块
     dim3 blockDim(16, 16);
-    dim3 gridDim((k + blockDim.x - 1) / blockDim.x, 
-                 (m + blockDim.y - 1) / blockDim.y, 
+    dim3 gridDim((k + blockDim.x - 1) / blockDim.x,
+                 (m + blockDim.y - 1) / blockDim.y,
                  batch_size);
     
     // 启动批量核函数
@@ -921,12 +929,11 @@ std::vector<float> CUDAMatrixOps::matrix_multiply_transpose_batch(
     
     // 复制结果回主机
     CHECK_CUDA_ERROR(cudaMemcpy(result.data(), d_result, result_size * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // 释放 GPU 内存
+
+    // 释放 GPU 内存（d_b 是常驻缓存的权重指针，不能释放）
     CHECK_CUDA_ERROR(cudaFree(d_a));
-    CHECK_CUDA_ERROR(cudaFree(d_b));
     CHECK_CUDA_ERROR(cudaFree(d_result));
-    
+
     return result;
 }
 
