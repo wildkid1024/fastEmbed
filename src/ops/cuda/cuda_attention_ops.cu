@@ -1,4 +1,5 @@
 #include "ops/cuda/cuda_attention_ops.cuh"
+#include "ops/cuda/cublas_gemm.h"
 #include "ops/cuda/device_weight_cache.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -343,28 +344,15 @@ std::vector<float> CUDAAttentionOps::multi_head_attention(
     CHECK_CUDA_ERROR(cudaMemcpy(d_input, input.data(), input_size, cudaMemcpyHostToDevice));
 
     // 矩阵乘法参数
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
     const size_t m = batch_size * seq_len;  // Rows of A and C
     const size_t n = embedding_dim;         // Columns of B and rows of A
     const size_t k = embedding_dim;         // Columns of B^T and C
 
-    // 使用核函数替代cuBLAS计算矩阵乘法
-    // 计算 Q = input * Wq^T + bq
-    dim3 block_size(16, 16);
-    dim3 grid_size((k + block_size.x - 1) / block_size.x, (m + block_size.y - 1) / block_size.y);
-    matrix_multiply_transpose_kernel<<<grid_size, block_size>>>(
-        d_input, d_wq, d_q, m, n, k, alpha, beta);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    // 计算 K = input * Wk^T + bk
-    matrix_multiply_transpose_kernel<<<grid_size, block_size>>>(
-        d_input, d_wk, d_k, m, n, k, alpha, beta);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    // 计算 V = input * Wv^T + bv
-    matrix_multiply_transpose_kernel<<<grid_size, block_size>>>(
-        d_input, d_wv, d_v, m, n, k, alpha, beta);
+    // Q/K/V 投影走 cuBLAS：Q = input * Wq^T，权重已是设备端常驻指针，直接传入。
+    // 这三处此前是朴素 kernel（约占 transformer 总算力的 25%），是长文本的主要瓶颈。
+    cublas_gemm::mm_nt(d_input, d_wq, d_q, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
+    cublas_gemm::mm_nt(d_input, d_wk, d_k, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
+    cublas_gemm::mm_nt(d_input, d_wv, d_v, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
     CHECK_CUDA_ERROR(cudaGetLastError());
 
     // 添加偏置

@@ -58,7 +58,9 @@ if(USE_CUDA)
         file(GLOB CUDA_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_cublas_ops.cu")
         # 编码器（双向）注意力实现，Gemma / EmbeddingGemma 使用
         set(CUDA_ENCODER_SOURCES "src/ops/cuda/cuda_encoder_attention_ops.cu")
-        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES})
+        # cuBLAS 版 GEMM（线性层加速，与注意力实现无关，两条路径都要）
+        set(CUDA_GEMM_SOURCES "src/ops/cuda/cuda_cublas_gemm.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES} ${CUDA_GEMM_SOURCES})
         # 添加 cuBLAS 库
         set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas ${SENTENCEPIECE_LIBRARIES})
     else()
@@ -68,9 +70,11 @@ if(USE_CUDA)
         file(GLOB CUDA_NON_CUBLAS_SOURCES "src/ops/cuda/cuda_attention_ops.cu")
         # 编码器（双向）注意力实现，Gemma / EmbeddingGemma 使用
         set(CUDA_ENCODER_SOURCES "src/ops/cuda/cuda_encoder_attention_ops.cu")
-        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES})
-        # 不添加 cuBLAS 库
-        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} ${SENTENCEPIECE_LIBRARIES})
+        # cuBLAS 版 GEMM（线性层加速）；注意力仍走自研 kernel，但 GEMM 依赖 cublas 库
+        set(CUDA_GEMM_SOURCES "src/ops/cuda/cuda_cublas_gemm.cu")
+        set(CUDA_SOURCES ${CUDA_BASE_SOURCES} ${CUDA_NON_CUBLAS_SOURCES} ${CUDA_ENCODER_SOURCES} ${CUDA_GEMM_SOURCES})
+        # 线性层已改用 cuBLAS，因此即使注意力不走 cuBLAS 分支也需链接该库
+        set(ADDITIONAL_LIBS ${CUDA_LIBRARIES} CUDA::cublas ${SENTENCEPIECE_LIBRARIES})
     endif()
     
     # C++ 源文件
@@ -163,9 +167,12 @@ if(USE_CUDA)
     # // 添加CUDA矩阵操作动态库
     add_library(cuda_matrix_ops SHARED
         src/ops/cuda/cuda_matrix_ops.cu
+        src/ops/cuda/cuda_cublas_gemm.cu
     )
     target_include_directories(cuda_matrix_ops PUBLIC include/ops/cuda)
     set_target_properties(cuda_matrix_ops PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    # 矩阵乘已改为 cuBLAS 实现
+    target_link_libraries(cuda_matrix_ops PRIVATE CUDA::cublas)
     
     # 根据是否使用 cuBLAS 添加相应的注意力操作源文件
     if(USE_CUBLAS)

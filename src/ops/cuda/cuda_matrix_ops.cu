@@ -1,5 +1,6 @@
 #include "ops/cuda/cuda_matrix_ops.h"
 #include "ops/cuda/device_weight_cache.h"
+#include "ops/cuda/cublas_gemm.h"
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
@@ -264,13 +265,8 @@ std::vector<float> CUDAMatrixOps::matrix_multiply(const std::vector<float>& a, c
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, a.data(), a_size * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA_ERROR(cudaMemcpy(d_b, b.data(), b_size * sizeof(float), cudaMemcpyHostToDevice));
 
-    // 配置核函数网格和块
-    dim3 blockDim(16, 16);
-    dim3 gridDim((k + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y);
-
-    // 启动核函数
-    matrix_multiply_kernel<<<gridDim, blockDim>>>(d_a, d_b, d_result, m, n, k);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    // cuBLAS GEMM：C[m,k] = A[m,n] * B[n,k]
+    cublas_gemm::mm_nn(d_a, d_b, d_result, (int)m, (int)n, (int)k);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
     // 复制结果回主机
@@ -296,13 +292,8 @@ std::vector<float> CUDAMatrixOps::matrix_multiply_transpose(const std::vector<fl
     // 权重：首次使用时上传并常驻，之后直接复用设备指针
     const float* d_weight = DeviceWeightCache::instance().get(b.data(), b.size());
 
-    // 配置核函数网格和块
-    dim3 blockDim(16, 16);
-    dim3 gridDim((k + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y);
-
-    // 启动核函数
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_weight, d_result, m, n, k);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    // cuBLAS GEMM：C[m,k] = A[m,n] * W[k,n]^T（权重原布局直接喂给 cublas，无需转置拷贝）
+    cublas_gemm::mm_nt(d_a, d_weight, d_result, (int)m, (int)n, (int)k);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
     // 复制结果回主机
@@ -764,17 +755,10 @@ std::vector<float> CUDAMatrixOps::mlp_fused(
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, input.data(), input_size * sizeof(float), cudaMemcpyHostToDevice));
 
     // Step 1: gate_proj = input × gate_weight^T [seq_len, hidden_size] × [hidden_size, intermediate_size]^T
-    dim3 blockDim(16, 16);
-    dim3 gridDim(
-        (intermediate_size + blockDim.x - 1) / blockDim.x,
-        (seq_len + blockDim.y - 1) / blockDim.y
-    );
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_gate_weight, d_gate_output, seq_len, hidden_size, intermediate_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_a, d_gate_weight, d_gate_output, (int)seq_len, (int)hidden_size, (int)intermediate_size);
 
     // Step 2: up_proj = input × up_weight^T
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_up_weight, d_up_output, seq_len, hidden_size, intermediate_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_a, d_up_weight, d_up_output, (int)seq_len, (int)hidden_size, (int)intermediate_size);
     
     // Step 3: SiLU(gate_output) * up_output
     int siluBlockSize = 256;
@@ -783,13 +767,7 @@ std::vector<float> CUDAMatrixOps::mlp_fused(
     CHECK_CUDA_ERROR(cudaGetLastError());
     
     // Step 4: down_proj = gate_up × down_weight^T (d_result存储输出)
-    dim3 downBlockDim(16, 16);
-    dim3 downGridDim(
-        (hidden_size + downBlockDim.x - 1) / downBlockDim.x,
-        (seq_len + downBlockDim.y - 1) / downBlockDim.y
-    );
-    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_down_weight, d_result, seq_len, intermediate_size, hidden_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_gate_up, d_down_weight, d_result, (int)seq_len, (int)intermediate_size, (int)hidden_size);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
     // 复制结果回主机
@@ -849,17 +827,10 @@ std::vector<float> CUDAMatrixOps::mlp_fused_gelu(
     // Step 1: gate_proj = input × gate_weight^T
     CHECK_CUDA_ERROR(cudaMemcpy(d_a, input.data(), input_size * sizeof(float), cudaMemcpyHostToDevice));
 
-    dim3 blockDim(16, 16);
-    dim3 gridDim(
-        (intermediate_size + blockDim.x - 1) / blockDim.x,
-        (seq_len + blockDim.y - 1) / blockDim.y
-    );
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_gate_weight, d_gate_output, seq_len, hidden_size, intermediate_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_a, d_gate_weight, d_gate_output, (int)seq_len, (int)hidden_size, (int)intermediate_size);
 
     // Step 2: up_proj = input × up_weight^T
-    matrix_multiply_transpose_kernel<<<gridDim, blockDim>>>(d_a, d_up_weight, d_up_output, seq_len, hidden_size, intermediate_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_a, d_up_weight, d_up_output, (int)seq_len, (int)hidden_size, (int)intermediate_size);
 
     // Step 3: GELU-tanh(gate_output) * up_output
     int geluBlockSize = 256;
@@ -868,13 +839,7 @@ std::vector<float> CUDAMatrixOps::mlp_fused_gelu(
     CHECK_CUDA_ERROR(cudaGetLastError());
 
     // Step 4: down_proj = gate_up × down_weight^T
-    dim3 downBlockDim(16, 16);
-    dim3 downGridDim(
-        (hidden_size + downBlockDim.x - 1) / downBlockDim.x,
-        (seq_len + downBlockDim.y - 1) / downBlockDim.y
-    );
-    matrix_multiply_transpose_kernel<<<downGridDim, downBlockDim>>>(d_gate_up, d_down_weight, d_result, seq_len, intermediate_size, hidden_size);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    cublas_gemm::mm_nt(d_gate_up, d_down_weight, d_result, (int)seq_len, (int)intermediate_size, (int)hidden_size);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
     std::vector<float> result(output_size);
@@ -910,21 +875,12 @@ std::vector<float> CUDAMatrixOps::matrix_multiply_transpose_batch(
     // 权重：首次使用时上传并常驻，所有 batch 元素共享同一份
     const float* d_b = DeviceWeightCache::instance().get(b.data(), b.size());
 
-    // 配置核函数网格和块
-    dim3 blockDim(16, 16);
-    dim3 gridDim((k + blockDim.x - 1) / blockDim.x,
-                 (m + blockDim.y - 1) / blockDim.y,
-                 batch_size);
-    
-    // 启动批量核函数
-    matrix_multiply_transpose_batch_kernel<<<gridDim, blockDim>>>(
-        d_a, d_b, d_result, 
-        static_cast<int>(batch_size), 
-        static_cast<int>(m), 
-        static_cast<int>(n), 
-        static_cast<int>(k)
-    );
-    CHECK_CUDA_ERROR(cudaGetLastError());
+    // 批量 cuBLAS GEMM：C[b,m,k] = A[b,m,n] * W[k,n]^T，权重在所有 batch 间共享（stride 0）
+    cublas_gemm::mm_nt_batch(d_a, d_b, d_result,
+                             static_cast<int>(batch_size),
+                             static_cast<int>(m),
+                             static_cast<int>(n),
+                             static_cast<int>(k));
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     
     // 复制结果回主机
